@@ -1,0 +1,41 @@
+diff --git a/vita3k/game-frontend/frontend.cpp b/vita3k/game-frontend/frontend.cpp
+index 102469b4..cdde978b 100644
+--- a/vita3k/game-frontend/frontend.cpp
++++ b/vita3k/game-frontend/frontend.cpp
+@@ -57,6 +57,9 @@
+ 
+ #ifdef _WIN32
+ #include <combaseapi.h>
++#include <windows.h>
++
++#include <cstdlib>
+ #endif
+ 
+ #include <SDL3/SDL.h>
+@@ -186,6 +189,16 @@ struct InstallItem {
+ } // namespace
+ 
+ int run(Profile &profile, int argc, char *argv[]) {
++    // a scripted run (a test driver's input pipe) must never take the user's focus: no Windows error or
++    // crash dialog, no C runtime abort box, no "not responding" ghost window, no error message box
++    const bool scripted = std::getenv("VITA3K_INPUT_PIPE") != nullptr;
++#ifdef _WIN32
++    if (scripted) {
++        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
++        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
++        DisableProcessWindowsGhosting();
++    }
++#endif
+     // command line:
+     //   --install-firmware <PUP>     install a firmware update file into the Vita file system
+     //   --install <zip|vpk|folder|pkg> [--license <work.bin|rif> | --zrif <zRIF>]
+@@ -241,7 +254,8 @@ int run(Profile &profile, int argc, char *argv[]) {
+     ctx.window_name = ctx.player == 1 ? profile.name : fmt::format("{} (player {})", profile.name, ctx.player);
+     const auto fail = [&](const std::string &message) {
+         LOG_ERROR("{}", message);
+-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, ctx.window_name.c_str(), message.c_str(), nullptr);
++        if (!scripted)
++            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, ctx.window_name.c_str(), message.c_str(), nullptr);
+     };
+ 
+     Root root_paths;

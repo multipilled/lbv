@@ -1,0 +1,29 @@
+From 8134a364b50a288064874d2c3c9743b8da4354ca Mon Sep 17 00:00:00 2001
+From: ReverseLover <255334704+ReverseLover@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:24:54 +0100
+Subject: [PATCH 54/58] modules/SceGxm: Allow null backing data in color
+ surface initialization
+
+This is valid native behavior verified from LibGXM's code.
+
+(cherry picked from commit d09ee69dd4d01536ca290b9600383c211d2bfddf)
+---
+ vita3k/modules/SceGxm/SceGxm.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index 94429d41..fdffe13e 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -1865,7 +1865,7 @@ EXPORT(int, sceGxmColorSurfaceInit, SceGxmColorSurface *surface, SceGxmColorForm
+     // the game's color surfaces (their sizes are its internal resolutions); set up rarely, so logged
+     LOG_INFO("Color surface {}x{} (stride {}), format {:#x}, scale mode {}", width, height, strideInPixels,
+         static_cast<uint32_t>(colorFormat), static_cast<int>(scaleMode));
+-    if (!surface || !data)
++    if (!surface)
+         return RET_ERROR(SCE_GXM_ERROR_INVALID_POINTER);
+ 
+     if (width == 0 || width > 4096 || height == 0 || height > 4096)
+-- 
+2.54.0.windows.1
+

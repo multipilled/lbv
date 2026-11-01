@@ -1,0 +1,108 @@
+From 3bba7862cfb7105229ff4f5767c4d4fee5d82d22 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Tue, 13 Oct 2026 09:34:57 +0900
+Subject: [PATCH 19/52] kernel: let kernel modules create mutexes with any
+ attributes (#4229)
+
+Since #4224, creating a mutex fails if it uses attributes that games
+aren't allowed to use. The kernel version, ksceKernelCreateMutex, used
+the same check. But SceSysmodule, which Vita3K runs at every boot,
+creates its mutex from the kernel with attribute 0x8000. That failed,
+and games like Hotline Miami stopped booting.
+
+Now the kernel version skips the attribute check. Games still get it.
+
+Fixes: 69cbf5429023 ("kernel: fix some sync primitive errors and edge cases found on hardware (#4224)")
+(cherry picked from commit 0b678f3522382bae561ab86875b97fbeec399886)
+---
+ vita3k/kernel/include/kernel/sync_primitives.h            | 5 +++--
+ vita3k/kernel/src/sync_primitives.cpp                     | 4 ++--
+ vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp        | 4 ++--
+ .../modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp  | 8 +++++++-
+ 4 files changed, 14 insertions(+), 7 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 7b9e18f3..5ba8f22b 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -139,8 +139,9 @@ typedef std::shared_ptr<Semaphore> SemaphorePtr;
+ class Mutex : public SyncPrimitive {
+ public:
+     Mutex(SceUInt32 attr, const char *name, SceInt32 init_count, ThreadStatePtr thread, Ptr<SceKernelLwMutexWork> workarea = {});
+-    // Returns the error for a name or count the guest can't use, or 0.
+-    static SceInt32 check_create(const char *name, SceUInt32 attr, SceInt32 init_count);
++    // Returns the error for a name, attributes or count the caller can't use, or 0. Kernel callers may
++    // use attributes games can't.
++    static SceInt32 check_create(const char *name, SceUInt32 attr, SceInt32 init_count, bool kernel);
+ 
+     SceInt32 acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 count, SceUInt32 *timeout, bool callbacks);
+     // Same as acquire, but reports the wait as target, for a condition variable taking its mutex back
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index f34d63bb..443b6030 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -407,10 +407,10 @@ Mutex::Mutex(SceUInt32 attr, const char *name, SceInt32 init_count, ThreadStateP
+     , lock_count(init_count)
+     , owner(init_count > 0 ? std::move(thread) : nullptr) {}
+ 
+-SceInt32 Mutex::check_create(const char *name, SceUInt32 attr, SceInt32 init_count) {
++SceInt32 Mutex::check_create(const char *name, SceUInt32 attr, SceInt32 init_count, bool kernel) {
+     if (const SceInt32 error = check_name(name, attr))
+         return error;
+-    if (attr & ~(SCE_KERNEL_MUTEX_ATTR_RECURSIVE | SCE_KERNEL_MUTEX_ATTR_CEILING | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE))
++    if (!kernel && attr & ~(SCE_KERNEL_MUTEX_ATTR_RECURSIVE | SCE_KERNEL_MUTEX_ATTR_CEILING | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE))
+         return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+     if (init_count < 0)
+         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index fb14cd61..545274f5 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -60,7 +60,7 @@ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const
+     if (!workarea)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+     const int init_count = opt.get(emuenv.mem)->init_count;
+-    if (const SceInt32 error = Mutex::check_create(name, attr, init_count))
++    if (const SceInt32 error = Mutex::check_create(name, attr, init_count, false))
+         return RET_ERROR(error);
+ 
+     const auto mutex = std::make_shared<LwMutex>(attr, name, init_count, emuenv.kernel.get_thread(thread_id), workarea);
+@@ -183,7 +183,7 @@ EXPORT(int, _sceKernelCreateMsgPipeWithLR) {
+ 
+ EXPORT(int, _sceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param) {
+     TRACY_FUNC(_sceKernelCreateMutex, name, attr, init_count, opt_param);
+-    if (const SceInt32 error = Mutex::check_create(name, attr, init_count))
++    if (const SceInt32 error = Mutex::check_create(name, attr, init_count, false))
+         return RET_ERROR(error);
+ 
+     const auto mutex = std::make_shared<HeavyMutex>(attr, name, init_count, emuenv.kernel.get_thread(thread_id));
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
+index 0bc4863e..1502b283 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
+@@ -23,6 +23,7 @@
+ TRACY_MODULE_NAME(SceThreadmgrForDriver);
+ 
+ #include <kernel/state.h>
++#include <kernel/sync_primitives.h>
+ 
+ EXPORT(int, ksceKernelCancelCallback) {
+     return UNIMPLEMENTED();
+@@ -78,7 +79,12 @@ EXPORT(int, ksceKernelCreateMsgPipe) {
+ 
+ EXPORT(int, ksceKernelCreateMutex, const char *name, SceUInt attr, int init_count, SceKernelMutexOptParam *opt_param) {
+     TRACY_FUNC(ksceKernelCreateMutex, name, attr, init_count, opt_param);
+-    return CALL_EXPORT(_sceKernelCreateMutex, name, attr, init_count, opt_param);
++    // Kernel modules use attributes games can't, like 0x8000 for SceSysmodule's mutex
++    if (const SceInt32 error = Mutex::check_create(name, attr, init_count, true))
++        return RET_ERROR(error);
++
++    const auto mutex = std::make_shared<HeavyMutex>(attr, name, init_count, emuenv.kernel.get_thread(thread_id));
++    return emuenv.kernel.objects.add(mutex, emuenv.kernel.get_next_uid());
+ }
+ 
+ EXPORT(int, ksceKernelCreateSema) {
+-- 
+2.54.0.windows.1
+

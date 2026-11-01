@@ -1,0 +1,44 @@
+From ca95bcd98719955921e47e26396802a8a3898cf0 Mon Sep 17 00:00:00 2001
+From: carfeii <277509339+carfeii@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 23:19:15 +0800
+Subject: [PATCH 28/52] Reject archive entries that escape the install
+ directory (#4253)
+
+install_archive_content() joined a zip entry's stored filename directly
+onto the computed install path and extracted to the result with no check
+for .. segments or an absolute path. A crafted .vpk entry name could
+therefore write a file outside the per-title install directory.
+
+Normalize the computed output path and the install directory, compute
+the former relative to the latter, and reject the entry if that relative
+path escapes (starts with ..) or can't be computed.
+
+Co-authored-by: carfeii <carfeii@users.noreply.github.com>
+(cherry picked from commit 55f88cd17a78ce8af7d753c7c4eb2f709f7d6dbc)
+---
+ vita3k/interface.cpp | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 01f06052..f10d8022 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -224,6 +224,15 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
+ 
+             std::string replace_filename = m_filename.substr(content_path.size());
+             const fs::path file_output = (output_path / fs_utils::utf8_to_path(replace_filename)).generic_path();
++
++            const fs::path normalized_output_path = output_path.lexically_normal();
++            const fs::path normalized_file_output = file_output.lexically_normal();
++            const fs::path relative_to_output = normalized_file_output.lexically_relative(normalized_output_path);
++            if (relative_to_output.empty() || relative_to_output.string().starts_with("..")) {
++                LOG_ERROR("Rejecting archive entry whose path escapes the install directory: {}", m_filename);
++                continue;
++            }
++
+             if (mz_zip_reader_is_file_a_directory(zip.get(), i)) {
+                 fs::create_directories(file_output);
+             } else {
+-- 
+2.54.0.windows.1
+

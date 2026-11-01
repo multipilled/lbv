@@ -1,0 +1,142 @@
+From 928ca704fce426c99f731c735d316ddfa179a2dd Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 8 Oct 2026 22:05:58 +0900
+Subject: [PATCH 15/52] kernel: implement sceKernelTryLockReadRWLock and
+ sceKernelTryLockWriteRWLock
+
+They take the lock when a wait would succeed at once, and return
+SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK when it would have to wait.
+
+(cherry picked from commit 184e472e54a17ec3255aae86dd4f17a11f9f5fde)
+---
+ .../kernel/include/kernel/sync_primitives.h   |  5 ++
+ vita3k/kernel/src/sync_primitives.cpp         | 49 ++++++++++++++-----
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 18 ++++---
+ 3 files changed, 53 insertions(+), 19 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index ed01967f..fd41da04 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -186,6 +186,8 @@ public:
+ 
+     SceInt32 acquire_read(const ThreadStatePtr &thread, SceUInt32 *timeout, bool callbacks);
+     SceInt32 acquire_write(const ThreadStatePtr &thread, SceUInt32 *timeout, bool callbacks);
++    SceInt32 try_acquire_read(const ThreadStatePtr &thread);
++    SceInt32 try_acquire_write(const ThreadStatePtr &thread);
+     SceInt32 release(const ThreadStatePtr &thread);
+     SceInt32 cancel(const ThreadStatePtr &thread, SceUInt32 *num_read_wait_threads, SceUInt32 *num_write_wait_threads, SceInt32 flag);
+ 
+@@ -201,6 +203,9 @@ public:
+ private:
+     void on_delete() override;
+     SceInt32 acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32 *timeout, bool callbacks);
++    SceInt32 try_acquire(const ThreadStatePtr &thread, bool is_write);
++    // Takes the lock if it is free for this kind of lock, or returns why it can't. The lock must be held.
++    SceInt32 try_take(const ThreadStatePtr &thread, bool is_write);
+ };
+ 
+ typedef std::shared_ptr<RWLock> RWLockPtr;
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index bc92e499..0f2bee8c 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -510,11 +510,7 @@ void RWLock::on_delete() {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+-SceInt32 RWLock::acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32 *timeout, bool callbacks) {
+-    auto guard = lock();
+-    if (!guard)
+-        return SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID;
+-
++SceInt32 RWLock::try_take(const ThreadStatePtr &thread, bool is_write) {
+     // if it is a read lock, it is always recursive
+     bool is_recursive = !is_write || (attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE);
+ 
+@@ -534,15 +530,42 @@ SceInt32 RWLock::acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32
+         state = is_write ? RWLockState::WriteLocked : RWLockState::ReadLocked;
+ 
+         return SCE_KERNEL_OK;
+-    } else if (!is_recursive && owners.contains(thread)) {
+-        return SCE_KERNEL_ERROR_RW_LOCK_RECURSIVE;
+-    } else {
+-        // we need to wait
+-        const Deadline deadline = deadline_from(timeout);
+-        const WaitResult r = waiters.wait(guard, thread, { SCE_KERNEL_WAITTYPE_RW_LOCK, uid }, { is_write }, deadline, callbacks);
+-        writeback_timeout(timeout, deadline);
+-        return guest_result(r);
+     }
++    if (!is_recursive && owners.contains(thread))
++        return SCE_KERNEL_ERROR_RW_LOCK_RECURSIVE;
++
++    return SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK;
++}
++
++SceInt32 RWLock::acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32 *timeout, bool callbacks) {
++    auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID;
++
++    if (const SceInt32 result = try_take(thread, is_write); result != SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK)
++        return result;
++
++    // we need to wait
++    const Deadline deadline = deadline_from(timeout);
++    const WaitResult r = waiters.wait(guard, thread, { SCE_KERNEL_WAITTYPE_RW_LOCK, uid }, { is_write }, deadline, callbacks);
++    writeback_timeout(timeout, deadline);
++    return guest_result(r);
++}
++
++SceInt32 RWLock::try_acquire(const ThreadStatePtr &thread, bool is_write) {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID;
++
++    return try_take(thread, is_write);
++}
++
++SceInt32 RWLock::try_acquire_read(const ThreadStatePtr &thread) {
++    return try_acquire(thread, false);
++}
++
++SceInt32 RWLock::try_acquire_write(const ThreadStatePtr &thread) {
++    return try_acquire(thread, true);
+ }
+ 
+ SceInt32 RWLock::acquire_read(const ThreadStatePtr &thread, SceUInt32 *timeout, bool callbacks) {
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index fe9ff20e..c4e7b926 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -1628,14 +1628,20 @@ EXPORT(int, sceKernelTryLockMutex, SceUID mutexid, int lock_count) {
+     return mutex->try_acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count);
+ }
+ 
+-EXPORT(int, sceKernelTryLockReadRWLock) {
+-    TRACY_FUNC(sceKernelTryLockReadRWLock);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelTryLockReadRWLock, SceUID lock_id) {
++    TRACY_FUNC(sceKernelTryLockReadRWLock, lock_id);
++    const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(lock_id);
++    if (!rwlock)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
++    return rwlock->try_acquire_read(emuenv.kernel.get_thread(thread_id));
+ }
+ 
+-EXPORT(int, sceKernelTryLockWriteRWLock) {
+-    TRACY_FUNC(sceKernelTryLockWriteRWLock);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelTryLockWriteRWLock, SceUID lock_id) {
++    TRACY_FUNC(sceKernelTryLockWriteRWLock, lock_id);
++    const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(lock_id);
++    if (!rwlock)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
++    return rwlock->try_acquire_write(emuenv.kernel.get_thread(thread_id));
+ }
+ 
+ EXPORT(int, sceKernelUnlockMutex, SceUID mutexid, int unlock_count) {
+-- 
+2.54.0.windows.1
+

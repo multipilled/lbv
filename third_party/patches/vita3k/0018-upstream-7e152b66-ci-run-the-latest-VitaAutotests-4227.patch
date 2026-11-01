@@ -1,0 +1,40 @@
+From 583f9a20ac78ac27ca449a31d1d54965c1e20d6a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Mon, 12 Oct 2026 18:28:37 +0900
+Subject: [PATCH 18/52] ci: run the latest VitaAutotests (#4227)
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the VitaAutotests commit that adds 34 more tests,
+and give each of them its outcome on Vita3K in expectations.txt. Five
+of them pass, the others fail or crash on what each line says. The
+names column is wider for the longer test names.
+
+* kernel: refuse creating a lightweight mutex with no work area
+
+Creating a lightweight mutex with a NULL work area wrote through the
+NULL pointer, which crashes Vita3K on some hosts. It now fails with
+ILLEGAL_ADDR, as on a Vita.
+
+(cherry picked from commit 7e152b66e85345f175d3d287fcbd7f8abec7574a)
+---
+ vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index a275ac07..fb14cd61 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -57,6 +57,8 @@ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID
+ 
+ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const char *name, unsigned int attr, Ptr<SceKernelCreateLwMutex_opt> opt) {
+     TRACY_FUNC(__sceKernelCreateLwMutex, workarea, name, attr, opt);
++    if (!workarea)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+     const int init_count = opt.get(emuenv.mem)->init_count;
+     if (const SceInt32 error = Mutex::check_create(name, attr, init_count))
+         return RET_ERROR(error);
+-- 
+2.54.0.windows.1
+

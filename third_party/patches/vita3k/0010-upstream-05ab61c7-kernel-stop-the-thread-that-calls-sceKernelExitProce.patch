@@ -1,0 +1,30 @@
+From c95ff926f6abb9861efec95ae643c8a745c2dbbb Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Fri, 9 Oct 2026 21:59:47 +0900
+Subject: [PATCH 10/52] kernel: stop the thread that calls sceKernelExitProcess
+
+It went on running after the call, so the C runtime exited again with 0
+and that replaced the exit code requested first.
+
+(cherry picked from commit 05ab61c766302257e35ac93a77cbadc936b0d22d)
+---
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index b1007639..eddf3ced 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1302,6 +1302,8 @@ EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
+ EXPORT(int, sceKernelExitProcess, int res) {
+     TRACY_FUNC(sceKernelExitProcess, res);
+     emuenv.kernel.request_process_exit(res);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
++    thread->exit(res);
+     return SCE_KERNEL_OK;
+ }
+ 
+-- 
+2.54.0.windows.1
+

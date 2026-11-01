@@ -1,0 +1,80 @@
+diff --git a/vita3k/CMakeLists.txt b/vita3k/CMakeLists.txt
+index 7237a28e..3fcdd57d 100644
+--- a/vita3k/CMakeLists.txt
++++ b/vita3k/CMakeLists.txt
+@@ -529,4 +529,6 @@ if(WIN32)
+ 	add_game(shinobido2 games/shinobido2/main.cpp games/shinobido2/saves.cpp games/shinobido2/saves.h)
+ 	# Killzone Mercenary (PCSF00403)
+ 	add_game(vekta-mercenary games/vekta-mercenary/main.cpp)
++	# LittleBigPlanet PS Vita (PCSA00549), the LBV project
++	add_game(lbv games/lbv/main.cpp)
+ endif()
+diff --git a/vita3k/games/lbv/main.cpp b/vita3k/games/lbv/main.cpp
+new file mode 100644
+index 00000000..29725f28
+--- /dev/null
++++ b/vita3k/games/lbv/main.cpp
+@@ -0,0 +1,63 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// lbv.exe: LittleBigPlanet PS Vita (Marvel Super Hero Edition, NA, PCSA00549) on the shared
++// single-game frontend (game-frontend/profile.h). The LBV project's docs describe the port.
++//
++// Milestone M0 of that project: the game's profile and settings file only, so the game can be
++// installed, its modules written (--dump-elfs) and booted on the JIT. No game-specific fixes yet.
++
++#include "../../game-frontend/profile.h"
++
++// provides WinMain for the windowed executable, which calls main below
++#include <SDL3/SDL_main.h>
++
++namespace {
++
++namespace layout = game_frontend::layout;
++
++constexpr const char *TITLE_ID = "PCSA00549";
++
++game_frontend::IniLayout ini_layout() {
++    const std::string id = "lbv", exe = "lbv.exe";
++    return {
++        "lbv settings. Lines starting with ; are comments; delete the ; to use a line.",
++        {
++            layout::paths(TITLE_ID, id, exe),
++            { "display", "",
++                { layout::scale(), layout::window_scale(), layout::fullscreen(id, exe), layout::vsync(),
++                    layout::filter(), layout::mipmaps(false) } },
++            layout::audio(),
++            layout::recompiled(id),
++            layout::debug(id),
++            layout::keyboard(),
++            layout::gamepad(),
++            layout::touch("; None yet.\n"),
++        },
++    };
++}
++
++} // namespace
++
++int main(int argc, char *argv[]) {
++    game_frontend::Profile profile;
++    profile.title_id = TITLE_ID;
++    profile.name = "LittleBigPlanet";
++    profile.id = "lbv";
++    profile.ini = ini_layout();
++    return game_frontend::run(profile, argc, argv);
++}

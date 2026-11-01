@@ -1,0 +1,42 @@
+From 429fc208907e1f05f05e6691aceb2a772fe68d9a Mon Sep 17 00:00:00 2001
+From: Zangetsu38 <dante38@free.fr>
+Date: Wed, 21 Oct 2026 18:31:55 +0200
+Subject: [PATCH 46/52] ngs/player: advance to populated next player buffer. -
+ When the current player slot is unavailable or empty, follow its
+ next_buffer_index if it identifies a valid, populated slot. Reset the byte
+ offset and continue processing so the voice does not end on empty initial
+ slot.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+(cherry picked from commit ba189e234886b5d7c74ea615bfe6cc3a62cdf000)
+---
+ vita3k/ngs/src/modules/player.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/vita3k/ngs/src/modules/player.cpp b/vita3k/ngs/src/modules/player.cpp
+index 6403d07e..624c31cd 100644
+--- a/vita3k/ngs/src/modules/player.cpp
++++ b/vita3k/ngs/src/modules/player.cpp
+@@ -127,6 +127,19 @@ bool PlayerModule::process(KernelState &kern, const MemState &mem, const SceUID
+         if ((state->current_buffer == -1)
+             || !params->buffer_params[state->current_buffer].buffer
+             || (params->buffer_params[state->current_buffer].bytes_count == 0)) {
++            if (state->current_buffer > -1) {
++                const int next_buffer_index = params->buffer_params[state->current_buffer].next_buffer_index;
++                if (next_buffer_index > -1
++                    && next_buffer_index < SCE_NGS_PLAYER_MAX_BUFFERS
++                    && params->buffer_params[next_buffer_index].buffer
++                    && params->buffer_params[next_buffer_index].bytes_count > 0) {
++                    state->current_buffer = next_buffer_index;
++                    state->current_byte_position_in_buffer = 0;
++                    logical->current_loop_count = 0;
++                    continue;
++                }
++            }
++
+             // Stop processing if no valid buffer is available or if the buffer is empty
+             finished = true;
+             break;
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,21 @@
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index f87c2366..9517f23e 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -1915,6 +1915,16 @@ std::vector<uint32_t> VKSurfaceCache::dump_frame(Ptr<const void> address, uint32
+     temp_buff.init_buffer(vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_mapped_alloc);
+     vk::CommandBuffer cmd_buffer = vkutil::create_single_time_command(state.device, state.general_command_pool);
+ 
++    // the scenes drew this surface as a colour attachment or, with shader interlock, as a storage image; without a
++    // barrier their writes need not be visible to the copy, which then reads stale memory (LBV: flat grey frames
++    // saved while the window showed the scene, RTX 3080)
++    const vk::MemoryBarrier written_to_copy{
++        .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite | vk::AccessFlagBits::eShaderWrite,
++        .dstAccessMask = vk::AccessFlagBits::eTransferRead
++    };
++    cmd_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput | vk::PipelineStageFlagBits::eFragmentShader,
++        vk::PipelineStageFlagBits::eTransfer, {}, written_to_copy, {}, {});
++
+     // layout is general, we can directly copy from it
+     vk::BufferImageCopy image_copy{
+         .bufferOffset = 0,

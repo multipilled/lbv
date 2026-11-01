@@ -1,0 +1,1064 @@
+From 26cecc9d90f36bd6480f289fe75d6d29d390cd98 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Mon, 19 Oct 2026 11:11:14 +0900
+Subject: [PATCH 31/52] kernel: clean up ThreadState creation and accessors
+
+(cherry picked from commit c82b97f7a474833f2a6f3c24f604e8d8e0c85ce1)
+---
+ vita3k/gdbstub/src/gdb.cpp                    |  12 +-
+ vita3k/gui-qt/src/debug_widget.cpp            |   4 +-
+ vita3k/interface.cpp                          |   2 +-
+ vita3k/kernel/include/kernel/state.h          |   3 +-
+ .../include/kernel/thread/thread_state.h      | 200 +++++++++------
+ .../kernel/include/kernel/thread/wait_queue.h |   2 +-
+ vita3k/kernel/src/kernel.cpp                  |  15 +-
+ vita3k/kernel/src/sync_primitives.cpp         |   2 +-
+ vita3k/kernel/src/thread.cpp                  | 240 +++++++++++++-----
+ vita3k/modules/SceAudio/SceAudio.cpp          |   4 +-
+ vita3k/modules/SceDisplay/SceDisplay.cpp      |   5 +-
+ vita3k/modules/SceGxm/SceGxm.cpp              |   2 +-
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       |  76 ++----
+ .../SceThreadmgrForDriver.cpp                 |   2 +-
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  |   2 +-
+ vita3k/modules/module_parent.cpp              |   4 +-
+ 16 files changed, 353 insertions(+), 222 deletions(-)
+
+diff --git a/vita3k/gdbstub/src/gdb.cpp b/vita3k/gdbstub/src/gdb.cpp
+index 80a7fd0a..92dc5d17 100644
+--- a/vita3k/gdbstub/src/gdb.cpp
++++ b/vita3k/gdbstub/src/gdb.cpp
+@@ -456,8 +456,7 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+             if (!thread->resume(true))
+                 return "E01";
+             // TODO: a step into a call that waits on a thread the debugger holds never returns
+-            auto lock = std::unique_lock(thread->mutex);
+-            thread->status_cond.wait(lock, [&]() { return thread->stopped_for_debugger() || thread->status == ThreadStatus::dormant || thread->status == ThreadStatus::deleted; });
++            thread->wait_until_stopped_for_debugger();
+ 
+             state.gdb.current_thread = thread_id;
+             return stop_reply(thread_id);
+@@ -475,8 +474,7 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+                 if (state.gdb.server_die)
+                     return "";
+                 for (const auto &[_, thread] : state.kernel.threads) {
+-                    const auto thread_guard = std::lock_guard(thread->mutex);
+-                    if (thread->stopped_for_debugger() && hit_breakpoint(*thread->cpu)) {
++                    if (thread->stopped_at_breakpoint()) {
+                         stopped = thread;
+                         break;
+                     }
+@@ -493,10 +491,8 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+ 
+             // Stop the world. A thread inside a kernel call stops when the call returns.
+             state.kernel.suspend_threads();
+-            for (const ThreadStatePtr &thread : list_threads(state)) {
+-                auto lock = std::unique_lock(thread->mutex);
+-                thread->status_cond.wait(lock, [&]() { return thread->status != ThreadStatus::running; });
+-            }
++            for (const ThreadStatePtr &thread : list_threads(state))
++                thread->wait_until_not_running();
+ 
+             state.gdb.current_thread = stopped->id;
+             return stop_reply(stopped->id);
+diff --git a/vita3k/gui-qt/src/debug_widget.cpp b/vita3k/gui-qt/src/debug_widget.cpp
+index e139edba..1b331449 100644
+--- a/vita3k/gui-qt/src/debug_widget.cpp
++++ b/vita3k/gui-qt/src/debug_widget.cpp
+@@ -237,7 +237,7 @@ void DebugWidget::refresh_threads() {
+         item->setData(0, Qt::UserRole, static_cast<uint>(id));
+         item->setText(0, QStringLiteral("0x%1").arg(id, 8, 16, QLatin1Char('0')).toUpper());
+         item->setText(1, QString::fromStdString(th->name));
+-        item->setText(2, thread_status_string(th->status));
++        item->setText(2, thread_status_string(th->get_status()));
+         item->setText(3, QStringLiteral("0x%1").arg(th->stack.get(), 8, 16, QLatin1Char('0')).toUpper());
+     }
+ }
+@@ -380,7 +380,7 @@ void DebugWidget::on_thread_double_clicked(QTreeWidgetItem *item, int /*column*/
+     };
+ 
+     form->addRow(tr("Name:"), new QLabel(QString::fromStdString(thread->name), dlg));
+-    form->addRow(tr("Status:"), new QLabel(thread_status_string(thread->status), dlg));
++    form->addRow(tr("Status:"), new QLabel(thread_status_string(thread->get_status()), dlg));
+     form->addRow(tr("PC:"), new QLabel(make_hex(pc), dlg));
+     form->addRow(tr("SP:"), new QLabel(make_hex(sp), dlg));
+     form->addRow(tr("LR:"), new QLabel(make_hex(lr), dlg));
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index f10d8022..8f19cae9 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -735,7 +735,7 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
+     // A main thread without its own affinity runs on every user core and reports them all
+     if (affinity == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
+         affinity = SCE_KERNEL_CPU_MASK_USER_ALL;
+-    const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, nullptr);
++    const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, 0, nullptr);
+     if (!main_thread) {
+         LOG_ERROR("Failed to init main thread.");
+         return InitThreadFailed;
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index fc7d2187..b709a3a5 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -176,7 +176,8 @@ struct KernelState {
+     void deinit(MemState &mem);
+     void load_process_param(MemState &mem, Ptr<uint32_t> ptr);
+     ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point = Ptr<const void>(0));
+-    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
++    // Creates a dormant thread with these creation arguments, attr without THREAD_ATTR_USER, or returns null
++    ThreadStatePtr create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option);
+ 
+     ThreadStatePtr get_thread(SceUID thread_id);
+ 
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 6e5c2bc1..cedc48f0 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -26,6 +26,7 @@
+ 
+ #include <algorithm>
+ #include <condition_variable>
++#include <expected>
+ #include <list>
+ #include <mutex>
+ #include <optional>
+@@ -62,62 +63,75 @@ enum class ThreadStatus : SceUInt32 {
+ };
+ 
+ struct ThreadState {
+-    std::mutex mutex;
+-    std::string name;
+-    SceUID id;
+-    Address entry_point;
+-
+-    Block stack;
+-    int stack_size;
+-    Block tls;
+-
++    // Fixed when the thread is created
++    const SceUID id;
++    const std::string name;
++    const Address entry_point;
+     // What thread info reports, the creation attributes and THREAD_ATTR_USER
+-    SceUInt32 attr = THREAD_ATTR_USER;
+-    int priority;
+-    SceInt32 affinity_mask;
+-    uint64_t last_vblank_waited;
+-
+-    CPUStatePtr cpu;
+-    ThreadStatus status = ThreadStatus::dormant;
+-    // What the thread waits on while waiting, empty otherwise
+-    WaitTarget wait_target;
+-
+-    std::condition_variable status_cond;
+-    // The exit status the guest sees: DORMANT until the first start, NOT_DORMANT while the thread
+-    // runs, then what it returned or exited with
+-    uint32_t returned_value = SCE_KERNEL_ERROR_DORMANT;
++    const SceUInt32 attr;
++    // The stack size, a whole number of pages
++    const int stack_size;
++    const Block stack;
++    const Block tls;
++    // The pointer is fixed. The registers are only touched by the thread itself, or while
++    // something holds it.
++    const CPUStatePtr cpu;
++    // The priority and the cores it was created with
++    const int init_priority;
++    const SceInt32 init_affinity_mask;
++    // The registers each run starts with
++    const CPUContext init_cpu_ctx;
+ 
+     ThreadState() = delete;
+-    explicit ThreadState(SceUID id, KernelState &kernel, MemState &mem);
++    // A dormant thread with its stack and TLS, which runs on cpu
++    ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option);
+ 
+-    int init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
++    // Lifecycle
+     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
+     // Ends the thread like sceKernelExitThread: the end handler runs, then it parks dormant
+     void exit(SceInt32 status);
+     // Ends the thread like sceKernelExitDeleteThread: the end handler runs, then it's deleted
+     void exit_delete(SceInt32 status);
++    // Deletes the thread like sceKernelDeleteThread, or returns NOT_DORMANT if it isn't dormant
++    SceInt32 remove_dormant();
+     // Deletes a dormant thread, or one being torn down, without running its end handler
+     void remove();
+-
+-    void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
+-    // Whether the thread is deleted, so guest calls can't find it
+-    bool is_deleted();
+-    Address stack_top() const;
+-
+     // Runs the thread's guest code. The host thread runs the top level, which parks the thread
+     // dormant between starts until it's deleted. A callback runs a nested level, which returns
+     // when the callback does or the thread ends.
+     void run_loop(bool top_level = true);
+-
+     // this function must be called from the thread itself (inside a svc call)
+     // With fresh_vfp_state, the call starts with the FPSCR and VFP exception setting of a new thread
+     uint32_t run_callback(Address callback_address, const std::vector<uint32_t> &args, bool fresh_vfp_state = false);
+-
+     // this function is called from another thread when this one is dormant
+     // it is only used for module loading and gxm display queue right now
+     // args and argp are passed to thread->start as is
+     uint32_t run_guest_function(Address callback_address, SceSize args = 0, const Ptr<void> argp = Ptr<void>{});
+ 
++    // Status and info
++    ThreadStatus get_status() const;
++    // Whether the thread is deleted, so guest calls can't find it
++    bool is_deleted();
++    // The status a thread that ended exited with, or NOT_DORMANT or DORMANT if it hasn't ended
++    std::expected<uint32_t, SceInt32> exit_status() const;
++    // The thread's info, as sceKernelGetThreadInfo reports it
++    SceKernelThreadInfo info();
++    // The room left on the stack, all of it for a dormant thread
++    int stack_free_size() const;
++    Address stack_top() const;
++    std::string log_stack_traceback() const;
++
++    // Priority and affinity
++    // The priority the thread runs at
++    int get_priority() const;
++    // Changes the priority the thread runs at, and the one its TLS shows. Returns the old priority.
++    int change_priority(int new_priority);
++    // The cores the thread may run on
++    SceInt32 get_affinity_mask() const;
++    // Changes the cores the thread may run on, and the ones its TLS shows. Returns the old mask.
++    SceInt32 change_affinity_mask(SceInt32 new_affinity_mask);
++
++    // Waits
+     // Blocks this thread until the deadline passes.
+     [[nodiscard]] WaitResult delay_until(Deadline deadline, bool callbacks);
+     // Blocks this thread until a signal is sent to it or the timeout passes, writing the time left back.
+@@ -126,14 +140,20 @@ struct ThreadState {
+     SceInt32 send_signal();
+     // Blocks waiter until this thread becomes dormant, then writes its exit status to exit_status.
+     [[nodiscard]] WaitResult wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks);
+-
+     // Waits on target until woken by wake(), the thread exits or is deleted, or the deadline passes.
+     // With callbacks, it also returns after running callbacks that were notified meanwhile.
+     // A stale wake or callbacks can end it early, so callers must recheck their condition.
+     [[nodiscard]] WaitResult wait(WaitTarget target, Deadline deadline, bool callbacks);
+     // Wakes this thread from wait().
+     void wake();
+-
++    // Shows the thread WAITING while a host call blocks it, such as an audio output, and RUNNING after
++    void begin_host_wait();
++    void end_host_wait();
++    // The vblank a display wait for vcount vblanks ends on: vcount after the one the thread's last
++    // display wait ended on, and at least next_vblank. The next display wait counts from it.
++    uint64_t next_display_wait(uint64_t next_vblank, int vcount);
++
++    // Callbacks
+     // Runs the notified callbacks of this thread and returns how many ran. Called by the thread itself.
+     SceUInt32 process_callbacks();
+     // Adds a callback this thread created. Called by the thread itself.
+@@ -142,16 +162,19 @@ struct ThreadState {
+     // with callbacks, and stops counting it. Called by the callback with its lock held.
+     void add_notified_callback();
+     void remove_notified_callback();
+-    // Whether a callback of this thread was notified and hasn't run yet. Called with mutex held.
+-    bool callbacks_notified() const { return notified_callbacks > 0; }
+ 
++    // Holds: the debugger, the emulator pause and the ForVM suspend
+     // Stops the thread for the debugger, the next time it would run guest code
+     void suspend();
+     // Lets a thread the debugger stopped run again, for one instruction with step. Returns whether it
+     // runs, which it doesn't while something else holds it. A step then doesn't happen at all.
+     bool resume(bool step = false);
+-    // Whether the thread has stopped for the debugger, where suspend() stops it. Called with mutex held.
+-    bool stopped_for_debugger() const { return holds.debugger && status == ThreadStatus::suspended; }
++    // Waits until the debugger's hold has stopped the thread, or it's dormant or deleted
++    void wait_until_stopped_for_debugger();
++    // Waits until the thread doesn't run guest code
++    void wait_until_not_running();
++    // Whether the debugger's hold stopped the thread at a breakpoint
++    bool stopped_at_breakpoint() const;
+     // Stops the thread while the emulator is paused, and lets it run again after
+     void pause();
+     void resume_from_pause();
+@@ -160,14 +183,10 @@ struct ThreadState {
+     // it, or an error for a dormant thread or a resume with no suspend.
+     int vm_suspend();
+     int vm_resume();
+-    // Whether vm_suspend holds the thread. Called with mutex held.
+-    bool vm_suspended() const { return holds.vm > 0; }
+-    // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
+-    void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
+-    // Whether the thread is inside a kernel call: waiting, or held on its way back from one. Called
+-    // with mutex held.
+-    bool in_wait() const { return status == ThreadStatus::waiting || (status == ThreadStatus::suspended && stop_point == StopPoint::syscall); }
+-    std::string log_stack_traceback() const;
++    // Waits until a ForVM suspend has stopped the thread, then gets the context it stopped with, its
++    // TPIDRURW and whether it stopped inside a kernel call. Returns NOT_SUSPENDED if no ForVM
++    // suspend holds it.
++    SceInt32 get_vm_context(CPUContext &context, uint32_t &tpidrurw, bool &in_kernel_call);
+ 
+ private:
+     // How a thread ends, each value stronger than the ones before it
+@@ -203,54 +222,91 @@ private:
+         syscall,
+     };
+ 
+-    // Whether the thread is ending. Called with mutex held.
++    struct EndWaitEntry {
++        // Where to write the exit status, or null
++        SceInt32 *exit_status;
++    };
++
++    // The private methods are called with mutex held, unless they say otherwise
++    void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
++    // Whether the thread is ending
+     bool exiting() const { return ending != Ending::none; }
++    // Asks the thread to end, keeping a stronger request already made
++    void request_ending(Ending how) { ending = std::max(ending, how); }
++    // Ends the thread without its end handler, whatever its status
++    void request_removal();
++    // Starts a dormant thread at entry, like start() does at its entry point. Takes mutex.
++    int start_at(Address entry, SceSize arglen, Ptr<void> argp, bool run_entry_callback);
++    // Whether a callback of this thread was notified and hasn't run yet
++    bool callbacks_notified() const { return notified_callbacks > 0; }
+     // Keeps the thread from going on into guest code while anything holds it, unless it's ending.
+-    // Called with mutex held through lock.
++    // With mutex held through lock.
+     void wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint where);
+-    // Asks the thread to end, keeping a stronger request already made. Called with mutex held.
+-    void request_ending(Ending how) { ending = std::max(ending, how); }
+-
++    // Whether the debugger's hold stopped the thread
++    bool stopped_for_debugger() const { return holds.debugger && status == ThreadStatus::suspended; }
++    // Whether the thread is inside a kernel call: waiting, or held on its way back from one
++    bool in_wait() const { return status == ThreadStatus::waiting || (status == ThreadStatus::suspended && stop_point == StopPoint::syscall); }
++    // Whether vm_suspend holds the thread
++    bool vm_suspended() const { return holds.vm > 0; }
++    // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
++    void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
++    // Called by the thread itself
+     void push_arguments(const std::vector<uint32_t> &args);
+     void dispatch_abort(CPUState &cpu);
+ 
++    // Fixed when the thread is created
+     KernelState &kernel;
++    MemState &mem;
+ 
+-    CPUContext init_cpu_ctx;
+-    Ending ending = Ending::none;
+-    Holds holds;
+-    // The debugger asked for one instruction, after which the thread holds again
+-    bool step_requested = false;
+-    // Where the thread stopped the last time something held it
+-    StopPoint stop_point = StopPoint::guest_code;
++    mutable std::mutex mutex;
+ 
++    // The rest is guarded by mutex, unless it says otherwise
++
++    // Lifecycle
++    ThreadStatus status = ThreadStatus::dormant;
++    // The exit status the guest sees: DORMANT until the first start, NOT_DORMANT while the thread
++    // runs, then what it returned or exited with
++    uint32_t returned_value = SCE_KERNEL_ERROR_DORMANT;
++    Ending ending = Ending::none;
+     // when calling sceKernelStartThread
+     bool run_start_callback = false;
++    // Notified whenever the status or a hold changes
++    std::condition_variable status_cond;
+ 
+-    MemState &mem;
++    // Priority and affinity
++    int priority;
++    SceInt32 affinity_mask;
+ 
+-    // A sceKernelSendSignal is pending for this thread.
+-    bool signal_pending = false;
++    // Waits
++    // What the thread waits on while waiting, empty otherwise
++    WaitTarget wait_target;
+     // Set by wake() and consumed by the next wait().
+     bool wake_pending = false;
++    // A sceKernelSendSignal is pending for this thread.
++    bool signal_pending = false;
++    // The vblank the thread's last display wait ended on
++    uint64_t last_vblank_waited = 0;
++    // Notified whenever a condition a wait may be blocked on changes.
++    std::condition_variable wait_cv;
++
++    // Callbacks
+     // Callbacks of this thread with notifications they haven't run for.
+     SceUInt32 notified_callbacks = 0;
+     // Set while the thread runs its callbacks. They don't nest.
+     bool is_processing_callbacks = false;
+-    // Callbacks this thread created, in creation order. The kernel owns them. Only this thread touches the list.
++    // Callbacks this thread created, in creation order. The kernel owns them. Only this thread
++    // touches the list.
+     std::list<std::weak_ptr<Callback>> callbacks;
+ 
+-    // Notified under mutex whenever a condition a wait may be blocked on changes.
+-    std::condition_variable wait_cv;
+-
+-    struct EndWaitEntry {
+-        // Where to write the exit status, or null
+-        SceInt32 *exit_status;
+-    };
++    // Holds
++    Holds holds;
++    // The debugger asked for one instruction, after which the thread holds again
++    bool step_requested = false;
++    // Where the thread stopped the last time something held it
++    StopPoint stop_point = StopPoint::guest_code;
+ 
+-    // Guards end_waiters. Taken after mutex when both are needed.
++    // Threads blocked in sceKernelWaitThreadEnd on this one, with their own lock, taken after mutex
+     std::mutex end_waiters_mutex;
+-    // Threads blocked in sceKernelWaitThreadEnd on this one.
+     WaitQueue<EndWaitEntry> end_waiters;
+ };
+ 
+diff --git a/vita3k/kernel/include/kernel/thread/wait_queue.h b/vita3k/kernel/include/kernel/thread/wait_queue.h
+index 1105a184..7e4c7359 100644
+--- a/vita3k/kernel/include/kernel/thread/wait_queue.h
++++ b/vita3k/kernel/include/kernel/thread/wait_queue.h
+@@ -63,7 +63,7 @@ public:
+     // With callbacks, the thread runs its notified callbacks while it waits.
+     [[nodiscard]] WaitResult wait_until_ready(std::unique_lock<std::mutex> &lock, const ThreadStatePtr &thread, WaitTarget target, Entry entry, Deadline deadline, bool callbacks, std::predicate<Waiter &> auto ready) {
+         Waiter waiter{ .thread = thread, .entry = std::move(entry) };
+-        waiter.priority = waiter.thread->priority;
++        waiter.priority = waiter.thread->get_priority();
+         push(waiter);
+         while (true) {
+             lock.unlock();
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index f0407c26..45dbaa43 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -177,13 +177,20 @@ bool KernelState::delete_callback(SceUID id) {
+ }
+ 
+ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point) {
+-    return create_thread(mem, name, entry_point, SCE_KERNEL_DEFAULT_PRIORITY, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, nullptr);
++    return create_thread(mem, name, entry_point, SCE_KERNEL_DEFAULT_PRIORITY, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_MAIN, 0, nullptr);
+ }
+ 
+-ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option) {
+-    ThreadStatePtr thread = std::make_shared<ThreadState>(get_next_uid(), *this, mem);
+-    if (thread->init(name, entry_point, init_priority, affinity_mask, stack_size, option) < 0)
++ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option) {
++    const SceUID id = get_next_uid();
++    int core_num = corenum_allocator.new_corenum();
++    if (core_num < 0) {
++        LOG_ERROR("Out of core number to allocate, use 0");
++        core_num = 0;
++    }
++    CPUStatePtr cpu = init_cpu(cpu_opt, id, static_cast<std::size_t>(core_num), mem);
++    if (!cpu)
+         return nullptr;
++    ThreadStatePtr thread = std::make_shared<ThreadState>(id, *this, mem, std::move(cpu), name, entry_point.address(), init_priority, affinity_mask, stack_size, attr, option);
+ 
+     {
+         const std::lock_guard<std::mutex> lock(mutex);
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 36f54c41..4bd467f6 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -277,7 +277,7 @@ SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, Sc
+         return result;
+ 
+     const Deadline guest_deadline = deadline_from(timeout);
+-    WaitQueue<std::monostate>::Waiter waiter{ .thread = thread, .priority = thread->priority };
++    WaitQueue<std::monostate>::Waiter waiter{ .thread = thread, .priority = thread->get_priority() };
+     waiters.push(waiter);
+ 
+     while (true) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 28072862..bf626602 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -36,60 +36,67 @@ constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
+ // What a thread waiting for a thread signal reports as its wait UID on a Vita, which isn't a UID
+ constexpr SceUID SIGNAL_WAIT_ID = 0x00010221;
+ 
+-int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option = nullptr) {
+-    constexpr size_t KERNEL_TLS_SIZE = 0x800;
+-
+-    // the stack size should be page-aligned
+-    stack_size = align(stack_size, KiB(4));
+-
+-    this->name = name;
+-    this->entry_point = entry_point.address();
+-
+-    int core_num = kernel.corenum_allocator.new_corenum();
+-    if (core_num < 0) {
+-        LOG_ERROR("Out of core number to allocate, use 0");
+-        core_num = 0;
++// The priority a thread created with priority runs at. The default range stands for the game's own.
++static int created_priority(int priority) {
++    if (priority > SCE_KERNEL_LOWEST_PRIORITY_USER) {
++        assert(SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY <= priority && priority <= SCE_KERNEL_LOWEST_DEFAULT_PRIORITY);
++        return priority - SCE_KERNEL_DEFAULT_PRIORITY + SCE_KERNEL_GAME_DEFAULT_PRIORITY_ACTUAL;
+     }
++    return priority;
++}
+ 
+-    if (init_priority > SCE_KERNEL_LOWEST_PRIORITY_USER) {
+-        assert(SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY <= init_priority && init_priority <= SCE_KERNEL_LOWEST_DEFAULT_PRIORITY);
+-        priority = init_priority - SCE_KERNEL_DEFAULT_PRIORITY + SCE_KERNEL_GAME_DEFAULT_PRIORITY_ACTUAL;
+-    } else {
+-        priority = init_priority;
+-    }
+-    this->affinity_mask = affinity_mask;
+-    this->stack_size = stack_size;
+-    last_vblank_waited = 0;
++// The size of the kernel's part of a thread's TLS, below the part the guest sees
++constexpr size_t KERNEL_TLS_SIZE = 0x800;
+ 
+-    cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+-    if (!cpu) {
+-        return SCE_KERNEL_ERROR_ERROR;
++// The registers each run of a thread starts with
++static CPUContext initial_context(Address stack_top, const SceKernelThreadOptParam *option) {
++    CPUContext ctx;
++    ctx.set_sp(stack_top);
++    ctx.fpscr = INITIAL_FPSCR;
++    if (option) {
++        ctx.cpu_registers[0] = option->attr;
++        ctx.cpu_registers[1] = option->size;
+     }
++    return ctx;
++}
++
++ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem, CPUStatePtr cpu, const char *name, Address entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, SceUInt32 attr, const SceKernelThreadOptParam *option)
++    : id(id)
++    , name(name)
++    , entry_point(entry_point)
++    , attr(attr | THREAD_ATTR_USER)
++    , stack_size(align(stack_size, KiB(4)))
++    , stack(alloc_block(mem, this->stack_size, fmt::format("Stack for thread {} (#{})", name, id).c_str()))
++    , tls(alloc_block(mem, KERNEL_TLS_SIZE + kernel.tls_msize, fmt::format("TLS for thread {} (#{})", name, id).c_str()))
++    , cpu(std::move(cpu))
++    , init_priority(created_priority(init_priority))
++    , init_affinity_mask(affinity_mask)
++    , init_cpu_ctx(initial_context(stack.get() + this->stack_size, option))
++    , kernel(kernel)
++    , mem(mem)
++    , priority(this->init_priority)
++    , affinity_mask(affinity_mask) {
+     // recompiled code calls imports itself (cpu/aot.h)
+-    cpu->import_handler = [this](CPUState &cpu_state, uint32_t nid) {
+-        kernel.call_import(cpu_state, nid, id);
++    this->cpu->import_handler = [this](CPUState &cpu_state, uint32_t nid) {
++        this->kernel.call_import(cpu_state, nid, this->id);
+     };
+     if (kernel.debugger.watch_code) {
+-        set_log_code(*cpu, true);
++        set_log_code(*this->cpu, true);
+     }
+     if (kernel.debugger.watch_memory) {
+-        set_log_mem(*cpu, true);
++        set_log_mem(*this->cpu, true);
+     }
+ 
+-    std::string alloc_name = fmt::format("Stack for thread {} (#{})", name, id);
+-    stack = alloc_block(mem, stack_size, alloc_name.c_str());
+-    memset(stack.get_ptr<void>().get(mem), 0xcc, stack_size);
++    memset(stack.get_ptr<void>().get(mem), 0xcc, this->stack_size);
+ 
+-    alloc_name = fmt::format("TLS for thread {} (#{})", name, id);
+     const size_t tls_size = KERNEL_TLS_SIZE + kernel.tls_msize;
+-    tls = alloc_block(mem, tls_size, alloc_name.c_str());
+     const Ptr<uint8_t> base_tls_ptr = tls.get_ptr<uint8_t>();
+     memset(base_tls_ptr.get(mem), 0, tls_size);
+ 
+     int *tls_array = tls.get_ptr<int>().get(mem);
+ 
+     tls_array[TLS_THREAD_ID] = id;
+-    tls_array[TLS_SP_TOP] = stack.get() + stack_size;
++    tls_array[TLS_SP_TOP] = stack.get() + this->stack_size;
+     tls_array[TLS_SP_BOTTOM] = stack.get();
+     // A Vita starts every thread with a different random value in each of these. These are the
+     // values one thread had on a PS Vita TV, the same for every thread so runs repeat.
+@@ -99,25 +106,18 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+     tls_array[TLS_CPU_AFFINITY_MASK] = affinity_mask;
+ 
+     const Ptr<uint8_t> user_tls_ptr = base_tls_ptr + KERNEL_TLS_SIZE;
+-    write_tpidruro(*cpu, user_tls_ptr.address());
++    write_tpidruro(*this->cpu, user_tls_ptr.address());
+     if (kernel.tls_address) {
+         assert(kernel.tls_psize <= kernel.tls_msize);
+         memcpy(user_tls_ptr.get(mem), kernel.tls_address.get(mem), kernel.tls_psize);
+     }
+-
+-    CPUContext ctx;
+-    ctx.set_sp(stack_top());
+-    ctx.fpscr = INITIAL_FPSCR;
+-    if (option) {
+-        ctx.cpu_registers[0] = option->attr;
+-        ctx.cpu_registers[1] = option->size;
+-    }
+-    this->init_cpu_ctx = ctx;
+-
+-    return 0;
+ }
+ 
+ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
++    return start_at(entry_point, arglen, argp, run_entry_callback);
++}
++
++int ThreadState::start_at(Address entry, SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
+     std::unique_lock<std::mutex> thread_lock(mutex);
+     if (status != ThreadStatus::dormant)
+         return SCE_KERNEL_ERROR_NOT_DORMANT;
+@@ -127,7 +127,7 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
+     load_context(*cpu, init_cpu_ctx);
+     // A thread starts with TPIDRURW at 0, also when it starts again
+     write_tpidrurw(*cpu, 0);
+-    write_pc(*cpu, entry_point);
++    write_pc(*cpu, entry);
+     write_lr(*cpu, kernel.halt_instruction_pc);
+     write_reg(*cpu, 0, arglen);
+ 
+@@ -160,7 +160,19 @@ void ThreadState::exit_delete(SceInt32 status) {
+ }
+ 
+ void ThreadState::remove() {
+-    std::lock_guard<std::mutex> lock(mutex);
++    const std::lock_guard<std::mutex> lock(mutex);
++    request_removal();
++}
++
++SceInt32 ThreadState::remove_dormant() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    if (status != ThreadStatus::dormant)
++        return SCE_KERNEL_ERROR_NOT_DORMANT;
++    request_removal();
++    return SCE_KERNEL_OK;
++}
++
++void ThreadState::request_removal() {
+     request_ending(Ending::remove);
+     // A dormant thread is gone at once
+     if (status == ThreadStatus::dormant)
+@@ -422,26 +434,12 @@ void ThreadState::dispatch_abort(CPUState &cpu) {
+ }
+ 
+ uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args, const Ptr<void> argp) {
+-    // save the previous entry point, just in case
+-    const auto old_entry_point = entry_point;
+-    entry_point = callback_address;
+-
+-    start(args, argp);
+-    {
+-        std::unique_lock<std::mutex> lock(mutex);
+-        status_cond.wait(lock, [&]() { return status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
+-    }
+-
+-    entry_point = old_entry_point;
++    start_at(callback_address, args, argp, false);
++    std::unique_lock<std::mutex> lock(mutex);
++    status_cond.wait(lock, [&]() { return status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
+     return returned_value;
+ }
+ 
+-ThreadState::ThreadState(SceUID id, KernelState &kernel, MemState &mem)
+-    : id(id)
+-    , kernel(kernel)
+-    , mem(mem) {
+-}
+-
+ void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus> expected) {
+     if (expected)
+         assert(expected.value() == this->status);
+@@ -505,6 +503,45 @@ bool ThreadState::is_deleted() {
+     return status == ThreadStatus::deleted;
+ }
+ 
++ThreadStatus ThreadState::get_status() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return status;
++}
++
++std::expected<uint32_t, SceInt32> ThreadState::exit_status() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    if (status != ThreadStatus::dormant)
++        return std::unexpected(SCE_KERNEL_ERROR_NOT_DORMANT);
++    // A thread that never started has no exit status yet
++    if (returned_value == static_cast<uint32_t>(SCE_KERNEL_ERROR_DORMANT))
++        return std::unexpected(SCE_KERNEL_ERROR_DORMANT);
++    return returned_value;
++}
++
++int ThreadState::stack_free_size() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    // A dormant thread's whole stack is free, a started one's is free below its stack pointer
++    if (status == ThreadStatus::dormant)
++        return stack_size;
++    return static_cast<int>(read_sp(*cpu) - stack.get());
++}
++
++void ThreadState::begin_host_wait() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    update_status(ThreadStatus::waiting);
++}
++
++void ThreadState::end_host_wait() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    update_status(ThreadStatus::running);
++}
++
++uint64_t ThreadState::next_display_wait(uint64_t next_vblank, int vcount) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    last_vblank_waited = std::max(next_vblank, last_vblank_waited + vcount);
++    return last_vblank_waited;
++}
++
+ WaitResult ThreadState::wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks) {
+     std::unique_lock<std::mutex> lock(mutex);
+     if (status == ThreadStatus::dormant || status == ThreadStatus::deleted) {
+@@ -606,6 +643,50 @@ void ThreadState::add_callback(const CallbackPtr &cb) {
+     callbacks.push_back(cb);
+ }
+ 
++SceKernelThreadInfo ThreadState::info() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    SceKernelThreadInfo info{};
++    strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
++    info.attr = attr;
++    info.stack = Ptr<void>(stack.get());
++    info.stackSize = stack_size;
++    info.initPriority = priority; // Todo Give only current priority
++    info.currentPriority = priority;
++    info.initCpuAffinityMask = affinity_mask; // Todo Give init affinity
++    info.currentCpuAffinityMask = affinity_mask;
++    info.entry = SceKernelThreadEntry(entry_point);
++    info.status = std::to_underlying(status);
++    info.waitType = wait_target.type;
++    info.waitId = wait_target.id;
++    info.exitStatus = returned_value;
++    info.fNotifyCallback = callbacks_notified() ? 1 : 0;
++    return info;
++}
++
++int ThreadState::get_priority() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return priority;
++}
++
++int ThreadState::change_priority(int new_priority) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    const int old_priority = std::exchange(priority, new_priority);
++    tls.get_ptr<int>().get(mem)[TLS_CURRENT_PRIORITY] = new_priority;
++    return old_priority;
++}
++
++SceInt32 ThreadState::get_affinity_mask() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return affinity_mask;
++}
++
++SceInt32 ThreadState::change_affinity_mask(SceInt32 new_affinity_mask) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    const SceInt32 old_affinity_mask = std::exchange(affinity_mask, new_affinity_mask);
++    tls.get_ptr<int>().get(mem)[TLS_CPU_AFFINITY_MASK] = new_affinity_mask;
++    return old_affinity_mask;
++}
++
+ Address ThreadState::stack_top() const {
+     return stack.get() + stack_size;
+ }
+@@ -677,6 +758,33 @@ void ThreadState::wait_for_vm_stop(std::unique_lock<std::mutex> &lock) {
+     status_cond.wait(lock, [&] { return status != ThreadStatus::running || !vm_suspended() || exiting(); });
+ }
+ 
++SceInt32 ThreadState::get_vm_context(CPUContext &context, uint32_t &tpidrurw, bool &in_kernel_call) {
++    std::unique_lock<std::mutex> lock(mutex);
++    // A thread whose wait timed out while suspended stops on its way back to its code
++    wait_for_vm_stop(lock);
++    if (!vm_suspended())
++        return SCE_KERNEL_ERROR_NOT_SUSPENDED;
++    context = save_context(*cpu);
++    tpidrurw = read_tpidrurw(*cpu);
++    in_kernel_call = in_wait();
++    return SCE_KERNEL_OK;
++}
++
++void ThreadState::wait_until_stopped_for_debugger() {
++    std::unique_lock<std::mutex> lock(mutex);
++    status_cond.wait(lock, [&] { return stopped_for_debugger() || status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
++}
++
++void ThreadState::wait_until_not_running() {
++    std::unique_lock<std::mutex> lock(mutex);
++    status_cond.wait(lock, [&] { return status != ThreadStatus::running; });
++}
++
++bool ThreadState::stopped_at_breakpoint() const {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return stopped_for_debugger() && hit_breakpoint(*cpu);
++}
++
+ int ThreadState::vm_resume() {
+     const std::lock_guard<std::mutex> lock(mutex);
+     // Like on a Vita, a dormant thread fails before the count does
+diff --git a/vita3k/modules/SceAudio/SceAudio.cpp b/vita3k/modules/SceAudio/SceAudio.cpp
+index 5f168c78..2e2f23b9 100644
+--- a/vita3k/modules/SceAudio/SceAudio.cpp
++++ b/vita3k/modules/SceAudio/SceAudio.cpp
+@@ -206,9 +206,9 @@ EXPORT(int, sceAudioOutOutput, int port, const void *buf) {
+         return RET_ERROR(SCE_AUDIO_OUT_ERROR_INVALID_PORT);
+     }
+     // is it really useful to update the thread status?
+-    thread->update_status(ThreadStatus::waiting);
++    thread->begin_host_wait();
+     emuenv.audio.audio_output(*prt, buf);
+-    thread->update_status(ThreadStatus::running);
++    thread->end_host_wait();
+ 
+     return prt->len;
+ }
+diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
+index a75dafbd..927fa375 100644
+--- a/vita3k/modules/SceDisplay/SceDisplay.cpp
++++ b/vita3k/modules/SceDisplay/SceDisplay.cpp
+@@ -45,10 +45,7 @@ static int display_wait(EmuEnvState &emuenv, SceUID thread_id, int vcount, const
+         // the wait is considered starting from the last time the thread resumed
+         // from a vblank wait (sceDisplayWait...) and not from the time this function was called
+         // but we still need to wait at least for one vblank
+-        const uint64_t next_vsync = emuenv.display.vblank_count + 1;
+-        const uint64_t min_vsync = thread->last_vblank_waited + vcount;
+-        thread->last_vblank_waited = std::max(next_vsync, min_vsync);
+-        target_vcount = thread->last_vblank_waited;
++        target_vcount = thread->next_display_wait(emuenv.display.vblank_count + 1, vcount);
+     }
+ 
+     wait_vblank(emuenv.display, thread, target_vcount, is_cb);
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index a959269e..20ee397b 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -2930,7 +2930,7 @@ EXPORT(int, sceGxmInitialize, const SceGxmInitializeParams *params) {
+     emuenv.gxm.display_queue.maxPendingCount_ = max_queue_size;
+ 
+     const ThreadStatePtr main_thread = emuenv.kernel.get_thread(thread_id);
+-    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, nullptr);
++    const ThreadStatePtr display_queue_thread = emuenv.kernel.create_thread(emuenv.mem, "SceGxmDisplayQueue", Ptr<void>(0), SCE_KERNEL_HIGHEST_PRIORITY_USER, SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT, SCE_KERNEL_STACK_SIZE_USER_DEFAULT, 0, nullptr);
+     if (!display_queue_thread) {
+         return RET_ERROR(SCE_GXM_ERROR_DRIVER);
+     }
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 939c9a22..9bd1c553 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -578,12 +578,11 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+     if (const int error = vm_target(emuenv, thread_id, threadId, thread))
+         return RET_ERROR(error);
+ 
+-    std::unique_lock<std::mutex> lock(thread->mutex);
+-    // A thread whose wait timed out while suspended stops on its way back to its code
+-    thread->wait_for_vm_stop(lock);
+-    if (!thread->vm_suspended())
+-        return RET_ERROR(SCE_KERNEL_ERROR_NOT_SUSPENDED);
+-    const auto context = save_context(*thread->cpu);
++    CPUContext context;
++    uint32_t tpidrurw = 0;
++    bool in_kernel_call = false;
++    if (const SceInt32 error = thread->get_vm_context(context, tpidrurw, in_kernel_call))
++        return RET_ERROR(error);
+ 
+     if (infoCpu) {
+         // A thread a guest can suspend runs in user mode
+@@ -593,12 +592,12 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+         infoCpu->sb = 100000; // Todo
+         infoCpu->st = 100000; // Todo
+         infoCpu->teehbr = 100000; // Todo
+-        infoCpu->tpidrurw = read_tpidrurw(*thread->cpu);
++        infoCpu->tpidrurw = tpidrurw;
+     }
+ 
+     if (infoVfp) {
+         static_assert(sizeof(infoVfp->reg) == sizeof(context.fpu_registers));
+-        if (thread->in_wait()) {
++        if (in_kernel_call) {
+             // Inside a syscall a Vita reports the FPSCR the kernel runs with, and only d8 to d15,
+             // which a call keeps. Every other d register reads this NaN.
+             constexpr uint32_t SCRUBBED[2] = { 0x7F80DEADU, 0x7FF8DEADU };
+@@ -624,7 +623,7 @@ EXPORT(SceInt32, _sceKernelGetThreadCpuAffinityMask, SceUID thid) {
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+ 
+-    return thread->affinity_mask;
++    return thread->get_affinity_mask();
+ }
+ 
+ EXPORT(int, _sceKernelGetThreadEventInfo) {
+@@ -640,13 +639,10 @@ EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
+     }
+     if (!pExitStatus)
+         return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+-    if (thread->status != ThreadStatus::dormant) {
+-        return SCE_KERNEL_ERROR_NOT_DORMANT;
+-    }
+-    // A thread that never started has no exit status yet
+-    if (thread->returned_value == static_cast<uint32_t>(SCE_KERNEL_ERROR_DORMANT))
+-        return SCE_KERNEL_ERROR_DORMANT;
+-    *pExitStatus = thread->returned_value;
++    const std::expected<uint32_t, SceInt32> exit_status = thread->exit_status();
++    if (!exit_status)
++        return exit_status.error();
++    *pExitStatus = *exit_status;
+     return 0;
+ }
+ 
+@@ -667,23 +663,7 @@ EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadIn
+ 
+     // TODO: SCE_KERNEL_ERROR_ILLEGAL_CONTEXT check
+ 
+-    const std::lock_guard<std::mutex> lock(thread->mutex);
+-    SceKernelThreadInfo full{};
+-    strncpy(full.name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
+-    full.attr = thread->attr;
+-    full.stack = Ptr<void>(thread->stack.get());
+-    full.stackSize = thread->stack_size;
+-    full.initPriority = thread->priority; // Todo Give only current priority
+-    full.currentPriority = thread->priority;
+-    full.initCpuAffinityMask = thread->affinity_mask; // Todo Give init affinity
+-    full.currentCpuAffinityMask = thread->affinity_mask;
+-    full.entry = SceKernelThreadEntry(thread->entry_point);
+-    full.status = std::to_underlying(thread->status);
+-    full.waitType = thread->wait_target.type;
+-    full.waitId = thread->wait_target.id;
+-    full.exitStatus = thread->returned_value;
+-    full.fNotifyCallback = thread->callbacks_notified() ? 1 : 0;
+-    write_info(info, full);
++    write_info(info, thread->info());
+     return SCE_KERNEL_OK;
+ }
+ 
+@@ -1106,14 +1086,10 @@ EXPORT(SceInt32, sceKernelChangeThreadCpuAffinityMask, SceUID thid, SceInt32 aff
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+ 
+-    const SceInt32 old_affinity = thread->affinity_mask;
+-
+     if (affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
+ 
+-    thread->affinity_mask = affinity_mask;
+-    thread->tls.get_ptr<int>().get(emuenv.mem)[TLS_CPU_AFFINITY_MASK] = affinity_mask;
+-    return old_affinity;
++    return thread->change_affinity_mask(affinity_mask);
+ }
+ 
+ EXPORT(SceInt32, sceKernelChangeThreadPriority2, SceUID thid, SceInt32 priority) {
+@@ -1122,10 +1098,8 @@ EXPORT(SceInt32, sceKernelChangeThreadPriority2, SceUID thid, SceInt32 priority)
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+ 
+-    const SceInt32 old_priority = thread->priority;
+-
+     if (priority == SCE_KERNEL_CURRENT_THREAD_PRIORITY) {
+-        priority = emuenv.kernel.get_thread(thread_id)->priority;
++        priority = emuenv.kernel.get_thread(thread_id)->get_priority();
+     }
+ 
+     if (priority >= SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY
+@@ -1136,10 +1110,7 @@ EXPORT(SceInt32, sceKernelChangeThreadPriority2, SceUID thid, SceInt32 priority)
+     if (priority < SCE_KERNEL_HIGHEST_PRIORITY_USER || priority > SCE_KERNEL_LOWEST_PRIORITY_USER)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+ 
+-    thread->priority = priority;
+-    thread->tls.get_ptr<int>().get(emuenv.mem)[TLS_CURRENT_PRIORITY] = priority;
+-
+-    return old_priority;
++    return thread->change_priority(priority);
+ }
+ 
+ EXPORT(SceInt32, sceKernelChangeThreadPriority, SceUID thid, SceInt32 priority) {
+@@ -1272,12 +1243,11 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+     // The new thread starts at the creating thread's current priority
+     if (init_priority == SCE_KERNEL_CURRENT_THREAD_PRIORITY)
+-        init_priority = emuenv.kernel.get_thread(thread_id)->priority;
++        init_priority = emuenv.kernel.get_thread(thread_id)->get_priority();
+ 
+-    const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), init_priority, options->cpu_affinity_mask, options->stack_size, options->option.get(emuenv.mem));
++    const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), init_priority, options->cpu_affinity_mask, options->stack_size, options->attr, options->option.get(emuenv.mem));
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_ERROR);
+-    thread->attr = options->attr | THREAD_ATTR_USER;
+     return thread->id;
+ }
+ 
+@@ -1396,9 +1366,8 @@ EXPORT(int, sceKernelDeleteThread, SceUID thid) {
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thid);
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+-    if (thread->status != ThreadStatus::dormant)
+-        return RET_ERROR(SCE_KERNEL_ERROR_NOT_DORMANT);
+-    thread->remove();
++    if (const SceInt32 error = thread->remove_dormant())
++        return RET_ERROR(error);
+     return 0;
+ }
+ 
+@@ -1455,10 +1424,7 @@ EXPORT(int, sceKernelGetThreadStackFreeSize, SceUID thid) {
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+ 
+-    // A dormant thread's whole stack is free, a started one's is free below its stack pointer
+-    if (thread->status == ThreadStatus::dormant)
+-        return thread->stack_size;
+-    return static_cast<int>(read_sp(*thread->cpu) - thread->stack.get());
++    return thread->stack_free_size();
+ }
+ 
+ EXPORT(Ptr<void>, sceKernelGetThreadTLSAddr, SceUID thid, int key) {
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
+index 1502b283..eb827d8e 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgrForDriver.cpp
+@@ -96,7 +96,7 @@ EXPORT(int, ksceKernelCreateSimpleEvent) {
+ }
+ 
+ EXPORT(SceUID, ksceKernelCreateThread, const char *name, SceKernelThreadEntry entry, int initPriority, SceSize stackSize, SceUInt attr, int cpuAffinityMask, void *pOptParam) {
+-    const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), initPriority, cpuAffinityMask, stackSize, nullptr);
++    const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), initPriority, cpuAffinityMask, stackSize, 0, nullptr);
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_ERROR);
+     return thread->id;
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 7f6863fc..82ccee0f 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1502,7 +1502,7 @@ EXPORT(SceInt32, sceKernelGetThreadCurrentPriority) {
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+ 
+-    return thread->priority;
++    return thread->get_priority();
+ }
+ 
+ EXPORT(int, sceKernelGetThreadEventInfo) {
+diff --git a/vita3k/modules/module_parent.cpp b/vita3k/modules/module_parent.cpp
+index 02f0d07a..53172d5d 100644
+--- a/vita3k/modules/module_parent.cpp
++++ b/vita3k/modules/module_parent.cpp
+@@ -409,7 +409,7 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
+         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;
+         SceInt32 affinity = SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT;
+         // module_start is always called from new thread
+-        const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_start, priority, affinity, stack_size, nullptr);
++        const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_start, priority, affinity, stack_size, 0, nullptr);
+ 
+         const uint32_t ret = module_thread->run_guest_function(module_start.address(), args, argp.cast<void>());
+         module_thread->remove();
+@@ -433,7 +433,7 @@ uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sce
+         SceInt32 stack_size = SCE_KERNEL_STACK_SIZE_USER_MAIN;
+         SceInt32 affinity = SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT;
+         // module_stop is always called from new thread
+-        const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_stop, priority, affinity, stack_size, nullptr);
++        const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_stop, priority, affinity, stack_size, 0, nullptr);
+ 
+         const uint32_t ret = module_thread->run_guest_function(module_stop.address(), args, argp.cast<void>());
+         module_thread->remove();
+-- 
+2.54.0.windows.1
+

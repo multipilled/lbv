@@ -1,0 +1,34 @@
+From 1761b7b355fbd9cc9c790a8a0b9993eb63b7cb08 Mon Sep 17 00:00:00 2001
+From: Zangetsu38 <dante38@free.fr>
+Date: Thu, 29 Oct 2026 03:53:41 +0100
+Subject: [PATCH 53/58] renderer: reset disabled depth-stencil state. - Reset
+ the full depth/stencil record when a scene has no enabled surface. - This
+ prevents stale background_depth values and flags from reaching Vulkan clear
+ values, and restores the expected disabled-surface defaults.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+(cherry picked from commit 197b5e14802beaeefd661da96b646c50674b8919)
+---
+ vita3k/renderer/src/scene.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/vita3k/renderer/src/scene.cpp b/vita3k/renderer/src/scene.cpp
+index b75c6408..7c6bc618 100644
+--- a/vita3k/renderer/src/scene.cpp
++++ b/vita3k/renderer/src/scene.cpp
+@@ -72,8 +72,10 @@ COMMAND(handle_set_context) {
+     if (depth_stencil_surface && !depth_stencil_surface->disabled()) {
+         render_context->record.depth_stencil_surface = *depth_stencil_surface;
+     } else {
+-        render_context->record.depth_stencil_surface.depth_data.reset();
+-        render_context->record.depth_stencil_surface.stencil_data.reset();
++        render_context->record.depth_stencil_surface = {};
++        render_context->record.depth_stencil_surface.background_depth = 1.0f;
++        render_context->record.depth_stencil_surface.mask = 1;
++        render_context->record.depth_stencil_surface.unk2 = 1;
+     }
+ 
+     destroy_command_payload(*helper.cmd);
+-- 
+2.54.0.windows.1
+

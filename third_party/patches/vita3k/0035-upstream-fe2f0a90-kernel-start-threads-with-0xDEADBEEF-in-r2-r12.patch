@@ -1,0 +1,39 @@
+From c7606790cb2eef7fa5a1bbc544abae90fd50678f Mon Sep 17 00:00:00 2001
+From: nishinji <nishinji@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 21:28:22 +0900
+Subject: [PATCH 35/52] kernel: start threads with 0xDEADBEEF in r2-r12
+
+A Vita starts every thread so (VitaAutotests thread_start_registers).
+Silverio Vendetta (PCSG00845) loader threads compare an unset r9 with
+the archive index, so with 0 they read data1.dat from fd -1 forever.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit fe2f0a90c72380d91d211ee42a73ed45ac5214d4)
+---
+ vita3k/kernel/src/thread.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index a4aaeab8..ee5ba429 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -25,6 +25,7 @@
+ 
+ #include <util/log.h>
+ 
++#include <algorithm>
+ #include <cassert>
+ #include <cstring>
+ #include <memory>
+@@ -51,6 +52,8 @@ constexpr size_t KERNEL_TLS_SIZE = 0x800;
+ // The registers each run of a thread starts with
+ static CPUContext initial_context(Address stack_top, const SceKernelThreadOptParam *option) {
+     CPUContext ctx;
++    // A Vita starts every thread with these in r2 to r12, and some games rely on r9 not being 0
++    std::fill(ctx.cpu_registers.begin() + 2, ctx.cpu_registers.begin() + 13, 0xDEADBEEF);
+     ctx.set_sp(stack_top);
+     ctx.fpscr = INITIAL_FPSCR;
+     if (option) {
+-- 
+2.54.0.windows.1
+

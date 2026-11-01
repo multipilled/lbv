@@ -1,0 +1,40 @@
+From 607d9deef64b544ada0d434c81f89d115c3599ad Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:35:22 -0400
+Subject: [PATCH 59/60] Surface cache: a texture inside a surface shadowed by a
+ later, smaller one finds it (Vita3K-Plus 6cd1cb84a)
+
+---
+ vita3k/renderer/src/vulkan/surface_cache.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 9517f23e8..7f5ec0441 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -570,6 +570,22 @@ std::optional<TextureLookupResult> VKSurfaceCache::retrieve_color_surface_as_tex
+     }
+     uint32_t total_surface_size = stride_bytes * original_height;
+ 
++    // a surface created later inside a larger one shadows it here (LBP: a 768x768 R16 shadow map inside the
++    // 768x1024 bloom surface, whose 360x204 tiles then missed on the stride and were read from stale memory):
++    // take the nearest surface below the address that covers it with this layout (Vita3K-Plus 6cd1cb84a)
++    if (tiling != ite->second->tiling || ite->second->stride_bytes != stride_bytes) {
++        for (auto it = ite; it != color_address_lookup.begin();) {
++            --it;
++            if (it->first + it->second->total_bytes > address && it->second->tiling == tiling
++                && it->second->stride_bytes == stride_bytes) {
++                ite = it;
++                if (*ite->second->dirty)
++                    return miss("dirty");
++                break;
++            }
++        }
++    }
++
+     ColorSurfaceCacheInfo &info = *ite->second;
+ 
+     if ((base_format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8 || info.format == SCE_GXM_COLOR_BASE_FORMAT_U8U8U8)
+-- 
+2.54.0.windows.1
+

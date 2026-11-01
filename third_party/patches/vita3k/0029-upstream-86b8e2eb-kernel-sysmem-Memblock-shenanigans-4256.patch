@@ -1,0 +1,766 @@
+From 16444d2b0f673a5b8479ea4deef3fd6f2d757bb1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Sat, 17 Oct 2026 01:29:28 +0900
+Subject: [PATCH 29/52] kernel/sysmem: Memblock shenanigans (#4256)
+
+* ci: run the latest VitaAutotests
+
+* sysmem: take only what a Vita takes in sceKernelAllocMemBlock
+
+* sysmem: count each block in its partition's free size
+
+* sysmem: fail a free of an unknown block with a Vita's error
+
+* sysmem: make blocks for code like a Vita's
+
+* kernel: fail a ForVM resume of a dormant thread like a Vita
+
+(cherry picked from commit 86b8e2eb5cabd9be9d937e29b22dddf3904dd661)
+---
+ vita3k/kernel/include/kernel/types.h          |  24 ++-
+ vita3k/kernel/src/thread.cpp                  |   3 +
+ vita3k/modules/SceSysmem/SceSysmem.cpp        | 201 ++++++++++++------
+ .../modules/SceSysmem/SceSysmemForDriver.cpp  | 154 +++++++-------
+ vita3k/modules/SceSysmem/SceSysmemForDriver.h | 119 +++++++++--
+ vita3k/modules/include/modules/sysmem_state.h |   7 +-
+ vita3k/modules/kubridge/kubridge.cpp          |  13 +-
+ 7 files changed, 345 insertions(+), 176 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index 2a2f4f0d..ad035f08 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -134,6 +134,7 @@
+ #define SCE_UID_INVALID_UID (SceUID)(0xFFFFFFFF)
+ 
+ #define SCE_ERROR_ERRNO_EINVAL 0x80010016
++#define SCE_ERROR_ERRNO_ENOSYS 0x80010058
+ 
+ constexpr size_t MODULE_INFO_NUM_SEGMENTS = 4;
+ 
+@@ -469,12 +470,26 @@ enum SceEventFlagWaitTypes {
+ };
+ 
+ enum SceKernelMemBlockType {
+-    SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE = 0x0C208060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_L1WBWA_RW = 0x09404060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_R = 0x09408040,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW = 0x09408060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_DEVICE_RW = 0x0C200860,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_R = 0x0C20D040,
+     SCE_KERNEL_MEMBLOCK_TYPE_USER_RX = 0x0C20D050,
+     SCE_KERNEL_MEMBLOCK_TYPE_USER_RW = 0x0C20D060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE = 0x0C208060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_GAME_RW = 0x0C50D060,
+     SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW = 0x0C80D060,
+     SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW = 0x0D808060,
+-    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW = 0x09408060
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_RW = 0x0CA0D060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_NC_RW = 0x0CA08060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_TOOL_RW = 0x0CF0D060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_TOOL_NC_RW = 0x0CF08060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RO_UNCACHE = 0x0E208040,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RX_UNCACHE = 0x0E208050,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RW_UNCACHE = 0x0E208060,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RO = 0x0E20D040,
++    SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RW = 0x0E20D060,
+ };
+ 
+ enum SceSysmoduleModuleId : uint16_t {
+@@ -690,6 +705,11 @@ struct SceKernelStopModuleOpt {
+     SceUInt32 stop;
+ };
+ 
++struct SceKernelVARange {
++    Address addr;
++    SceSize size;
++};
++
+ struct SceKernelMemBlockInfo {
+     SceSize size;
+     Ptr<void> mappedBase;
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 43e14779..28072862 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -679,6 +679,9 @@ void ThreadState::wait_for_vm_stop(std::unique_lock<std::mutex> &lock) {
+ 
+ int ThreadState::vm_resume() {
+     const std::lock_guard<std::mutex> lock(mutex);
++    // Like on a Vita, a dormant thread fails before the count does
++    if (status == ThreadStatus::dormant)
++        return SCE_KERNEL_ERROR_DORMANT;
+     if (holds.vm == 0)
+         return VM_NOT_SUSPENDED;
+     if (--holds.vm > 0)
+diff --git a/vita3k/modules/SceSysmem/SceSysmem.cpp b/vita3k/modules/SceSysmem/SceSysmem.cpp
+index 5c718926..a1cdc210 100644
+--- a/vita3k/modules/SceSysmem/SceSysmem.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmem.cpp
+@@ -28,6 +28,8 @@
+ #include <util/string_utils.h>
+ 
+ #include <util/tracy.h>
++
++#include <algorithm>
+ TRACY_MODULE_NAME(SceSysmem);
+ 
+ std::string to_debug_str(const MemState &mem, SceKernelMemBlockType type) {
+@@ -38,6 +40,7 @@ std::string to_debug_str(const MemState &mem, SceKernelMemBlockType type) {
+     case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW: return "SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW";
+     case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW: return "SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW";
+     case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW: return "SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW";
++    default: break;
+     }
+     return std::to_string(type);
+ }
+@@ -47,10 +50,11 @@ struct SceKernelAllocMemBlockOpt {
+     SceUInt32 attr;
+     SceSize alignment;
+     SceUInt32 uidBaseBlock;
+-    const char *strBaseBlockName;
++    Ptr<const char> strBaseBlockName;
+     int flags;
+     int reserved[10];
+ };
++static_assert(sizeof(SceKernelAllocMemBlockOpt) == 0x40);
+ 
+ struct SceKernelFreeMemorySizeInfo {
+     int size; //!< sizeof(SceKernelFreeMemorySizeInfo)
+@@ -63,53 +67,123 @@ LIBRARY_INIT(SceSysmem) {
+     emuenv.kernel.obj_store.create<SysmemState>();
+ }
+ 
++// The error for a block type an app can't allocate, or 0
++static SceInt32 type_error(SceKernelMemBlockType type) {
++    switch (type) {
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_R:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_DEVICE_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_GAME_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_CDIALOG_NC_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RO_UNCACHE:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RW_UNCACHE:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RO:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_L1WBWA_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_R:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
++        return 0;
++    // Types a Vita knows but keeps from apps
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_TOOL_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_TOOL_NC_RW:
++    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDIALOG_RX_UNCACHE:
++        return SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_TYPE;
++    default:
++        return SCE_KERNEL_ERROR_ILLEGAL_BLOCK_TYPE;
++    }
++}
++
++// The error for a size a block of a user type can't have, or 0
++static SceInt32 size_error(SceKernelMemBlockType type, SceSize size) {
++    if (size == 0)
++        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
++    switch (type & MEMBLOCK_TYPE_PHYMEMPART_MASK) {
++    case MEMBLOCK_TYPE_PHYMEMPART_CDRAM:
++        return size % MEMBLOCK_CDRAM_MIN_ALIGNMENT ? SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE_CDRAM : 0;
++    case MEMBLOCK_TYPE_PHYMEMPART_PHYCONT:
++        return size % MEMBLOCK_PHYCONT_MIN_ALIGNMENT ? SCE_KERNEL_ERROR_INVALID_ARGUMENT : 0;
++    default:
++        return size % MEMBLOCK_MIN_ALIGNMENT ? SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_SIZE : 0;
++    }
++}
++
++// The error for an alignment a block of a user type can't ask for, or 0
++static SceInt32 alignment_error(SceKernelMemBlockType type, SceSize alignment) {
++    const SceUInt32 phymempart = type & MEMBLOCK_TYPE_PHYMEMPART_MASK;
++    if (phymempart == MEMBLOCK_TYPE_PHYMEMPART_PHYCONT || (alignment & (alignment - 1)) != 0)
++        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
++    if (alignment == 0)
++        return 0;
++    if (phymempart == MEMBLOCK_TYPE_PHYMEMPART_CDRAM) {
++        if (alignment < MEMBLOCK_CDRAM_MIN_ALIGNMENT)
++            return SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE_CDRAM;
++        return alignment > MiB(64) ? SCE_KERNEL_ERROR_INVALID_ARGUMENT : 0;
++    }
++    return alignment > MiB(16) ? SCE_KERNEL_ERROR_INVALID_ARGUMENT : 0;
++}
++
+ EXPORT(SceUID, sceKernelAllocMemBlock, const char *pName, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockOpt *optp) {
+     TRACY_FUNC(sceKernelAllocMemBlock, pName, type, size, optp);
++    if (!pName)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    if (optp) {
++        constexpr SceSize OPT_SIZES[] = { 0x14, 0x38, 0x3C, 0x40 };
++        // An app can't choose an address, a physical address or a base block
++        constexpr SceUInt32 ALLOWED_ATTRS = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_ENABLE_OPEN
++            | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT;
++        if (!std::ranges::contains(OPT_SIZES, optp->size))
++            return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
++        // The last word of the largest option must be 0
++        if (optp->size == sizeof(SceKernelAllocMemBlockOpt) && optp->reserved[9] != 0)
++            return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++        if (optp->attr & ~ALLOWED_ATTRS)
++            return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++    }
++    if (const SceInt32 error = type_error(type))
++        return RET_ERROR(error);
++    if (const SceInt32 error = size_error(type, size))
++        return RET_ERROR(error);
+ 
+     // Build kernel opts from user opts
+-    SceKernelAllocMemBlockKernelOpt k_opt = {};
++    SceKernelAllocMemBlockOptKernel k_opt = {};
+     k_opt.size = sizeof(k_opt);
+-    SceKernelAllocMemBlockKernelOpt *k_opt_ptr = nullptr;
+-
+-    if (optp) {
+-        if (optp->attr & SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT) {
+-            k_opt.attr |= SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
+-            k_opt.alignment = optp->alignment;
+-        }
+-        k_opt_ptr = &k_opt;
++    if (optp && (optp->attr & SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT)) {
++        if (const SceInt32 error = alignment_error(type, optp->alignment))
++            return RET_ERROR(error);
++        k_opt.attr |= SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
++        k_opt.alignment = optp->alignment;
+     }
+ 
+-    return CALL_EXPORT(ksceKernelAllocMemBlock, pName, type, size, k_opt_ptr);
++    return CALL_EXPORT(ksceKernelAllocMemBlock, pName, type, size, optp ? &k_opt : nullptr);
+ }
+ 
+-EXPORT(int, sceKernelAllocMemBlockForVM, const char *pName, SceSize size) {
++EXPORT(SceUID, sceKernelAllocMemBlockForVM, const char *pName, SceSize size) {
+     TRACY_FUNC(sceKernelAllocMemBlockForVM, pName, size);
+     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+-    const auto guard = std::lock_guard<std::mutex>(state->mutex);
+-
+-    MemState &mem = emuenv.mem;
+-    assert(pName != nullptr);
+-
+-    if (size < 0x1000 || (size & 0xFFF) != 0) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+-    }
+-
+-    const Ptr<void> address(alloc(mem, size, pName));
+-    if (!address) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++    std::unique_lock<std::mutex> lock(state->mutex);
++    if (!pName)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    // A size of 0 gets past this, and the allocation fails on it
++    if (size % MiB(1))
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_MEMBLOCK_SIZE);
++    if (size > MiB(16) - state->vm_space_used)
++        return RET_ERROR(SCE_KERNEL_ERROR_MEMBLOCK_OVERFLOW);
++    state->vm_space_used += size;
++    lock.unlock();
++
++    const SceUID uid = CALL_EXPORT(ksceKernelAllocMemBlock, pName, SCE_KERNEL_MEMBLOCK_TYPE_USER_RX, size, nullptr);
++    lock.lock();
++    // The block is missing if the allocation failed, or if another thread freed it before the lock
++    const Blocks::const_iterator block = state->blocks.find(uid);
++    if (block == state->blocks.end()) {
++        state->vm_space_used -= size;
++        return uid < 0 ? uid : RET_ERROR(SCE_KERNEL_ERROR_INVALID_UID);
+     }
+-
+-    const SceUID uid = state->get_next_uid();
+-
+-    const KernelMemBlockPtr sceKernelMemBlock = std::make_shared<KernelMemBlock>();
+-    sceKernelMemBlock->mappedBase = address;
+-    sceKernelMemBlock->mappedSize = size;
+-    sceKernelMemBlock->size = sizeof(SceKernelMemBlockInfo);
+-    std::strncpy(sceKernelMemBlock->name, pName, KERNELOBJECT_MAX_NAME_LENGTH);
+-    state->blocks.emplace(uid, sceKernelMemBlock);
+-    state->vm_blocks.emplace(uid, sceKernelMemBlock);
+-    state->allocated_user += size;
+-
++    state->vm_blocks.emplace(uid, SceKernelVARange{ block->second->mappedBase.address(), size });
+     return uid;
+ }
+ 
+@@ -130,7 +204,12 @@ EXPORT(int, sceKernelCloseMemBlock) {
+ 
+ EXPORT(int, sceKernelCloseVMDomain) {
+     TRACY_FUNC(sceKernelCloseVMDomain);
+-    return UNIMPLEMENTED();
++    const auto state = emuenv.kernel.obj_store.get<SysmemState>();
++    const auto guard = std::lock_guard<std::mutex>(state->mutex);
++    if (!state->vm_domain_open)
++        return RET_ERROR(SCE_ERROR_ERRNO_ENOSYS);
++    state->vm_domain_open = false;
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(SceUID, sceKernelFindMemBlockByAddr, Address addr, uint32_t size) {
+@@ -154,18 +233,15 @@ EXPORT(int, sceKernelFreeMemBlock, SceUID uid) {
+ EXPORT(int, sceKernelFreeMemBlockForVM, SceUID uid) {
+     TRACY_FUNC(sceKernelFreeMemBlockForVM, uid);
+     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+-    const auto guard = std::lock_guard<std::mutex>(state->mutex);
+-
+-    assert(uid >= 0);
+-    const Blocks::const_iterator block = state->vm_blocks.find(uid);
+-    assert(block != state->vm_blocks.end());
+-
+-    free(emuenv.mem, block->second->mappedBase.address());
+-    state->allocated_user -= block->second->size;
+-    state->blocks.erase(block);
+-    state->vm_blocks.erase(block);
+-
+-    return SCE_KERNEL_OK;
++    {
++        const auto guard = std::lock_guard<std::mutex>(state->mutex);
++        const auto block = state->vm_blocks.find(uid);
++        if (block == state->vm_blocks.end())
++            return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++        state->vm_space_used -= block->second.size;
++        state->vm_blocks.erase(block);
++    }
++    return CALL_EXPORT(ksceKernelFreeMemBlock, uid);
+ }
+ 
+ EXPORT(int, sceKernelGetFreeMemorySize, SceKernelFreeMemorySizeInfo *info) {
+@@ -273,7 +349,13 @@ EXPORT(SceUID, sceKernelOpenMemBlock, const char *pName, int flags) {
+ 
+ EXPORT(int, sceKernelOpenVMDomain) {
+     TRACY_FUNC(sceKernelOpenVMDomain);
+-    return UNIMPLEMENTED();
++    const auto state = emuenv.kernel.obj_store.get<SysmemState>();
++    const auto guard = std::lock_guard<std::mutex>(state->mutex);
++    // Blocks for code are always writable here, so the domain is only a state
++    if (state->vm_domain_open)
++        return RET_ERROR(SCE_ERROR_ERRNO_ENOSYS);
++    state->vm_domain_open = true;
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, sceKernelSyncVMDomain, SceUID block_uid, Address base, uint32_t size) {
+@@ -281,17 +363,16 @@ EXPORT(int, sceKernelSyncVMDomain, SceUID block_uid, Address base, uint32_t size
+     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+     const auto guard = std::lock_guard<std::mutex>(state->mutex);
+ 
+-    const auto it = state->vm_blocks.find(block_uid);
+-    if (it == state->vm_blocks.end()) {
++    // The blocks for code first, then any block
++    SceKernelVARange range;
++    if (const auto vm_block = state->vm_blocks.find(block_uid); vm_block != state->vm_blocks.end())
++        range = vm_block->second;
++    else if (const auto block = state->blocks.find(block_uid); block != state->blocks.end())
++        range = { block->second->mappedBase.address(), block->second->mappedSize };
++    else
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID);
+-    }
+-
+-    const auto block = it->second;
+-    const uint32_t block_base_end = block->mappedBase.address() + block->mappedSize;
+-    const uint32_t base_end = base + size;
+-    if (block->mappedBase.address() > base_end || base > block_base_end) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_BLOCK_ERROR);
+-    }
++    if (base < range.addr || uint64_t(base) + size > uint64_t(range.addr) + range.size)
++        return RET_ERROR(SCE_KERNEL_ERROR_MEMBLOCK_RANGE_ERROR);
+     invalidate_jit_cache(*emuenv.kernel.get_thread(thread_id)->cpu, base, size);
+ 
+     return 0;
+diff --git a/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp b/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
+index d13576eb..a6d80f27 100644
+--- a/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
+@@ -70,38 +70,87 @@ EXPORT(int, ksceKernelAllocHeapMemoryWithOption) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockKernelOpt *opt) {
+-    MemState &mem = emuenv.mem;
+-
+-    if (!name || !size) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++// Where blocks of a user type go: CDRAM, the common dialog's memory, uncached main memory or main
++// memory. Kernel types go to main memory.
++static Address region_start(SceKernelMemBlockType type) {
++    if (type & MEMBLOCK_TYPE_KERNEL_MASK)
++        return USER_MAIN_BASE;
++    const SceUInt32 partition_index = type & MEMBLOCK_TYPE_PARTITION_INDEX_MASK;
++    const bool uncached = (type & MEMBLOCK_TYPE_MEMORY_ATTR_MASK) == MEMBLOCK_TYPE_MEMORY_ATTR_NORMAL_NC;
++    if (partition_index == MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDRAM)
++        return USER_CDRAM_BASE;
++    if (partition_index == MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDIALOG)
++        return uncached ? USER_CDIALOG_UNCACHED_BASE : USER_CDIALOG_BASE;
++    return uncached ? USER_UNCACHED_BASE : USER_MAIN_BASE;
++}
++
++// The smallest alignment of a block of the type, which for a user type depends on its ScePhyMemPart
++static SceSize min_alignment(SceKernelMemBlockType type) {
++    if (type & MEMBLOCK_TYPE_KERNEL_MASK)
++        return MEMBLOCK_MIN_ALIGNMENT;
++    switch (type & MEMBLOCK_TYPE_PHYMEMPART_MASK) {
++    case MEMBLOCK_TYPE_PHYMEMPART_CDRAM:
++        return MEMBLOCK_CDRAM_MIN_ALIGNMENT;
++    case MEMBLOCK_TYPE_PHYMEMPART_PHYCONT:
++        return MEMBLOCK_PHYCONT_MIN_ALIGNMENT;
++    default:
++        return MEMBLOCK_MIN_ALIGNMENT;
+     }
++}
+ 
+-    int min_alignment;
+-    switch (type) {
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RX:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
+-        min_alignment = 0x1000;
++// Adds size, negative for a freed block, to the allocated count of the partition a block of the type
++// takes from. Common dialog blocks take from none.
++static void count_block(SysmemState &state, SceKernelMemBlockType type, SceSSize size) {
++    if ((type & MEMBLOCK_TYPE_PARTITION_INDEX_MASK) == MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDIALOG)
++        return;
++    switch (type & MEMBLOCK_TYPE_PHYMEMPART_MASK) {
++    case MEMBLOCK_TYPE_PHYMEMPART_CDRAM:
++        state.allocated_cdram += size;
+         break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
+-        min_alignment = 0x40000;
++    case MEMBLOCK_TYPE_PHYMEMPART_PHYCONT:
++        state.allocated_phycont += size;
+         break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
+-        min_alignment = 0x100000;
++    case MEMBLOCK_TYPE_PHYMEMPART_CDIALOG:
+         break;
+     default:
+-        min_alignment = 0x1000;
++        state.allocated_user += size;
+         break;
+     }
++}
++
++SceUID add_block(SysmemState &state, const char *name, SceKernelMemBlockType type, Address base, SceSize size) {
++    const SceUID uid = state.get_next_uid();
++    const auto block = std::make_shared<KernelMemBlock>();
++    block->type = type;
++    block->mappedBase = Ptr<void>(base);
++    block->mappedSize = size;
++    block->size = sizeof(SceKernelMemBlockInfo);
++    // What the info calls report: the normal memory type bits of the memory attributes, and an app's
++    // read and write access
++    block->memoryType = ((type & MEMBLOCK_TYPE_MEMORY_ATTR_MASK) >> MEMBLOCK_TYPE_MEMORY_ATTR_SHIFT) & SCE_KERNEL_MEMORY_TYPE_NORMAL;
++    block->access = ((type & MEMBLOCK_TYPE_USER_ACCESS_MASK) >> MEMBLOCK_TYPE_USER_ACCESS_SHIFT) & (SCE_KERNEL_MEMORY_ACCESS_R | SCE_KERNEL_MEMORY_ACCESS_W);
++    std::strncpy(block->name, name, KERNELOBJECT_MAX_NAME_LENGTH);
++    state.blocks.emplace(uid, block);
++    count_block(state, type, size);
++    return uid;
++}
++
++EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockOptKernel *opt) {
++    MemState &mem = emuenv.mem;
++
++    if (!name || !size) {
++        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++    }
+ 
+-    SceSize alignment = min_alignment;
++    SceSize alignment = min_alignment(type);
+     Address base_address = 0;
+ 
+     if (opt) {
++        constexpr SceUInt32 IMPLEMENTED_ATTRS = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_VBASE | SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
++        if (const SceUInt32 ignored = opt->attr & ~IMPLEMENTED_ATTRS)
++            LOG_WARN("ksceKernelAllocMemBlock: ignoring attributes {} of block {}", log_hex(ignored), name);
+         if (opt->attr & SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_VBASE) {
+-            base_address = opt->field_C;
++            base_address = opt->vbase.address();
+         }
+         if (opt->attr & SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT) {
+             if (opt->alignment & (opt->alignment - 1))
+@@ -123,54 +172,13 @@ EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType
+         }
+         address = Ptr<void>(addr);
+     } else {
+-        // Pick start address based on type
+-        Address start_address;
+-        switch (type) {
+-        case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
+-        case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
+-            start_address = 0x70000000U;
+-            break;
+-        case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
+-            start_address = 0x60000000U;
+-            break;
+-        default:
+-            start_address = 0x80000000U;
+-            break;
+-        }
+-        address = Ptr<void>(alloc_aligned(mem, size, name, alignment, start_address));
++        address = Ptr<void>(alloc_aligned(mem, size, name, alignment, region_start(type)));
+         if (!address) {
+             return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+         }
+     }
+ 
+-    const SceUID uid = state->get_next_uid();
+-    const auto block = std::make_shared<KernelMemBlock>();
+-    block->type = type;
+-    block->mappedBase = address;
+-    block->mappedSize = size;
+-    block->size = sizeof(SceKernelMemBlockInfo);
+-    std::strncpy(block->name, name, KERNELOBJECT_MAX_NAME_LENGTH);
+-    state->blocks.emplace(uid, block);
+-
+-    switch (type) {
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RX:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
+-        state->allocated_user += size;
+-        break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
+-        state->allocated_cdram += size;
+-        break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
+-        state->allocated_phycont += size;
+-        break;
+-    default:
+-        state->allocated_user += size;
+-        break;
+-    }
+-
+-    return uid;
++    return add_block(*state, name, type, address.address(), size);
+ }
+ 
+ EXPORT(int, ksceKernelAllocMemBlockWithInfo) {
+@@ -259,28 +267,10 @@ EXPORT(int, ksceKernelFreeMemBlock, SceUID uid) {
+ 
+     const Blocks::const_iterator block = state->blocks.find(uid);
+     if (block == state->blocks.end())
+-        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_BLOCK_ID);
++        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_UID);
+ 
+     free(emuenv.mem, block->second->mappedBase.address());
+-
+-    switch (block->second->type) {
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RX:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_RW_UNCACHE:
+-        state->allocated_user -= block->second->size;
+-        break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_CDRAM_RW:
+-        state->allocated_cdram -= block->second->size;
+-        break;
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_RW:
+-    case SCE_KERNEL_MEMBLOCK_TYPE_USER_MAIN_PHYCONT_NC_RW:
+-        state->allocated_phycont -= block->second->size;
+-        break;
+-    default:
+-        state->allocated_user -= block->second->size;
+-        break;
+-    }
+-
++    count_block(*state, block->second->type, -static_cast<SceSSize>(block->second->mappedSize));
+     state->blocks.erase(block);
+     return SCE_KERNEL_OK;
+ }
+diff --git a/vita3k/modules/SceSysmem/SceSysmemForDriver.h b/vita3k/modules/SceSysmem/SceSysmemForDriver.h
+index 0dee9f1e..ec5408f9 100644
+--- a/vita3k/modules/SceSysmem/SceSysmemForDriver.h
++++ b/vita3k/modules/SceSysmem/SceSysmemForDriver.h
+@@ -20,34 +20,109 @@
+ #include <kernel/types.h>
+ #include <module/module.h>
+ 
+-struct SceKernelAllocMemBlockKernelOpt {
++struct SceKernelAllocMemBlockOptKernel {
+     SceSize size;
+-    SceUInt32 field_4;
++    SceUInt32 unk_4;
+     SceUInt32 attr;
+-    SceUInt32 field_C; // vbase when attr & 0x1
+-    SceUInt32 paddr;
++    // The address to map the block at
++    Ptr<void> vbase;
++    // The physical address to use as its base
++    SceUInt32 pbase;
+     SceSize alignment;
+-    SceUInt32 extraLow;
+-    SceUInt32 extraHigh;
+-    SceUInt32 mirror_blockid;
++    // The sizes of the extra areas from vbase and after the block
++    SceSize extraLow;
++    SceSize extraHigh;
++    // The block this one is based on
++    SceUID baseMemBlock;
+     SceUID pid;
+-    uint32_t *paddr_list;
+-    SceUInt32 field_2C;
+-    SceUInt32 field_30;
+-    SceUInt32 field_34;
+-    SceUInt32 field_38;
+-    SceUInt32 field_3C;
+-    SceUInt32 field_40;
+-    SceUInt32 field_44;
+-    SceUInt32 field_48;
+-    SceUInt32 field_4C;
+-    SceUInt32 field_50;
+-    SceUInt32 field_54;
++    // A SceKernelPAVector
++    Ptr<void> pPAV;
++    // What the block's size is rounded up to
++    SceSize roundupUnitSize;
++    SceUInt8 domain;
++    // Related to SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_0x20
++    SceUInt32 unk_34[9];
+ };
++static_assert(sizeof(SceKernelAllocMemBlockOptKernel) == 0x58);
+ 
+-constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_VBASE = 0x1;
+-constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT = 4;
++// Attributes of an allocation, most of which enable a member of its option
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_VBASE = 0x00000001;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_PBASE = 0x00000002;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT = 0x00000004;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_EXTRA_LOW = 0x00000008;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_EXTRA_HIGH = 0x00000010;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_0x20 = 0x00000020;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_BASE = 0x00000040;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_PID = 0x00000080;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_BASENAME = 0x00000200;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_PPAV = 0x00001000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ROUNDUP = 0x00002000;
++// sceKernelOpenMemBlock may open the block
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_ENABLE_OPEN = 0x00004000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_DOMAIN = 0x00010000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_NOPHYPAGE = 0x00020000;
++// Don't map the block
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_DONT_MAP = 0x00040000;
++// The block is physically contiguous
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT = 0x00200000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_UNK = 0x00400000;
++// The block shares its base block's address or physical pages, with HAS_BASE
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_SHARE_VBASE = 0x00800000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_SHARE_PHYPAGE = 0x01000000;
++constexpr SceUInt32 SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_ALLOW_PARTIAL_OP = 0x04000000;
+ 
+-DECL_EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockKernelOpt *opt);
++// Fields of a memory block type code
++// Set for a kernel type
++constexpr SceUInt32 MEMBLOCK_TYPE_KERNEL_MASK = 0xF0000000;
++// The partition index, which picks the user address range
++constexpr SceUInt32 MEMBLOCK_TYPE_PARTITION_INDEX_MASK = 0x0F000000;
++// The ScePhyMemPart its physical memory comes from
++constexpr SceUInt32 MEMBLOCK_TYPE_PHYMEMPART_MASK = 0x00F00000;
++// The memory attributes of its pages, from the ARM TEX, C and B bits, which the info calls report the
++// SCE_KERNEL_MEMORY_TYPE_NORMAL bits of as the memory type
++constexpr SceUInt32 MEMBLOCK_TYPE_MEMORY_ATTR_MASK = 0x0000FF00;
++constexpr SceUInt32 MEMBLOCK_TYPE_MEMORY_ATTR_SHIFT = 8;
++// What an app may do with it, which the info calls report as the access
++constexpr SceUInt32 MEMBLOCK_TYPE_USER_ACCESS_MASK = 0x000000F0;
++constexpr SceUInt32 MEMBLOCK_TYPE_USER_ACCESS_SHIFT = 4;
++
++// The access bits of a block, which the info calls report without execute
++constexpr SceUInt32 SCE_KERNEL_MEMORY_ACCESS_R = 0x04;
++constexpr SceUInt32 SCE_KERNEL_MEMORY_ACCESS_W = 0x02;
++constexpr SceUInt32 SCE_KERNEL_MEMORY_ACCESS_X = 0x01;
++
++constexpr SceUInt32 MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDRAM = 0x09000000;
++constexpr SceUInt32 MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDIALOG = 0x0E000000;
++constexpr SceUInt32 MEMBLOCK_TYPE_PHYMEMPART_CDRAM = 0x00400000;
++constexpr SceUInt32 MEMBLOCK_TYPE_PHYMEMPART_PHYCONT = 0x00800000;
++constexpr SceUInt32 MEMBLOCK_TYPE_PHYMEMPART_CDIALOG = 0x00A00000;
++// Sharable device memory, which the info calls report as memory type 0
++constexpr SceUInt32 MEMBLOCK_TYPE_MEMORY_ATTR_DEVICE = 0x00000800;
++constexpr SceUInt32 MEMBLOCK_TYPE_MEMORY_ATTR_NORMAL_NC = 0x00008000;
++
++// The memory types the info calls report
++constexpr SceUInt32 SCE_KERNEL_MEMORY_TYPE_NORMAL_NC = 0x80;
++constexpr SceUInt32 SCE_KERNEL_MEMORY_TYPE_NORMAL = 0xD0;
++
++// The smallest alignment of a block, of a CDRAM one and of a physically contiguous one. The size of
++// an app's block is a multiple of it too.
++constexpr SceSize MEMBLOCK_MIN_ALIGNMENT = KiB(4);
++constexpr SceSize MEMBLOCK_CDRAM_MIN_ALIGNMENT = KiB(256);
++constexpr SceSize MEMBLOCK_PHYCONT_MIN_ALIGNMENT = MiB(1);
++
++// Where an app's blocks go, by user region
++constexpr Address USER_CDRAM_BASE = 0x60000000;
++constexpr Address USER_CDIALOG_UNCACHED_BASE = 0x68000000;
++constexpr Address USER_UNCACHED_BASE = 0x70000000;
++constexpr Address USER_MAIN_BASE = 0x80000000;
++constexpr Address USER_CDIALOG_BASE = 0xD0000000;
++
++struct SysmemState;
++
++// Adds a block of the type at base to the blocks and counts it in its partition's free size, with the
++// state's mutex held
++SceUID add_block(SysmemState &state, const char *name, SceKernelMemBlockType type, Address base, SceSize size);
++
++DECL_EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType type, SceSize size, SceKernelAllocMemBlockOptKernel *opt);
+ DECL_EXPORT(int, ksceKernelGetMemBlockBase, SceUID uid, Ptr<void> *basep);
+ DECL_EXPORT(int, ksceKernelFreeMemBlock, SceUID uid);
+diff --git a/vita3k/modules/include/modules/sysmem_state.h b/vita3k/modules/include/modules/sysmem_state.h
+index fe2b9ca0..f040797a 100644
+--- a/vita3k/modules/include/modules/sysmem_state.h
++++ b/vita3k/modules/include/modules/sysmem_state.h
+@@ -38,13 +38,18 @@ typedef std::map<SceUID, KernelMemBlockPtr> Blocks;
+ struct SysmemState {
+     std::mutex mutex;
+     Blocks blocks;
+-    Blocks vm_blocks;
+     SceUID next_uid = 1;
+ 
+     uint32_t allocated_user = 0;
+     uint32_t allocated_cdram = 0;
+     uint32_t allocated_phycont = 0;
+ 
++    // The blocks for code. Only sceKernelFreeMemBlockForVM takes one out and gives its space back.
++    std::map<SceUID, SceKernelVARange> vm_blocks;
++    // The address space they take, of the 16 MiB they share
++    SceSize vm_space_used = 0;
++    bool vm_domain_open = false;
++
+     SceUID get_next_uid() {
+         return next_uid++;
+     }
+diff --git a/vita3k/modules/kubridge/kubridge.cpp b/vita3k/modules/kubridge/kubridge.cpp
+index 141f9049..3362c4b0 100644
+--- a/vita3k/modules/kubridge/kubridge.cpp
++++ b/vita3k/modules/kubridge/kubridge.cpp
+@@ -21,6 +21,8 @@
+ // These HLE implementations provide equivalent functionality using
+ // Vita3K's memory system.
+ 
++#include "../SceSysmem/SceSysmemForDriver.h"
++
+ #include <module/module.h>
+ 
+ #include <cpu/functions.h>
+@@ -133,15 +135,8 @@ EXPORT(SceUID, kuKernelMemReserve, Ptr<Ptr<void>> addr, SceSize size, SceKernelM
+     // Store the allocated address back
+     *addr.get(mem) = Ptr<void>(allocated_addr);
+ 
+-    // Track as a vm_block
+-    const SceUID uid = state->get_next_uid();
+-    auto block = std::make_shared<KernelMemBlock>();
+-    block->type = memBlockType;
+-    block->mappedBase = Ptr<void>(allocated_addr);
+-    block->mappedSize = size;
+-    block->size = sizeof(SceKernelMemBlockInfo);
+-    std::strncpy(block->name, "kubridge_reserve", KERNELOBJECT_MAX_NAME_LENGTH);
+-    state->vm_blocks.emplace(uid, block);
++    // Track it like any other memory block
++    const SceUID uid = add_block(*state, "kubridge_reserve", memBlockType, allocated_addr, size);
+ 
+     LOG_DEBUG("kuKernelMemReserve: addr=0x{:08X} size={} type=0x{:08X} uid=0x{:08X}",
+         allocated_addr, size, (uint32_t)memBlockType, uid);
+-- 
+2.54.0.windows.1
+

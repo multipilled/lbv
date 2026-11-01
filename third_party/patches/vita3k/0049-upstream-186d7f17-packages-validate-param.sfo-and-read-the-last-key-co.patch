@@ -1,0 +1,266 @@
+From b385be3937d624c552ed3c373598af1dc1fd1c11 Mon Sep 17 00:00:00 2001
+From: BreDoyliesSea <doylies@encrypt.eu>
+Date: Fri, 30 Oct 2026 06:51:44 -0600
+Subject: [PATCH 49/52] packages: validate param.sfo and read the last key
+ correctly (#4204)
+
+* packages: Read a param.sfo key only up to its null terminator
+
+A key's length was taken from the next key's offset, and for the last key
+from the start of the data table. The key table is padded to four bytes, so
+the last key kept the padding as trailing nulls and never matched a lookup:
+VERSION in most games (two to three bytes of padding in Spelunky and
+Disgaea 4), and TITLE_ID in a param.sfo where it is the last key. An install
+then read an empty title ID and its destination became ux0/app itself, which
+an overwrite deletes (#4113).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Refuse a param.sfo whose tables do not fit the file
+
+sfo::load trusted the header, so an encrypted param.sfo - UPPERS (PCSG00633)
+ships its save data template as one, at disc/savedata/sce_sys/param.sfo - was
+read as a header claiming three billion entries: installing the game aborted
+with std::bad_alloc, and an install that got past it read no title ID (#4113).
+The magic and every table offset are now checked against the file, and the
+installers skip a param.sfo that does not load instead of reusing the
+previous one's details.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Start each param.sfo read from empty app info
+
+The installers read every param.sfo into the same emuenv.app_info. A key
+the file lacks kept the value the previous install left there, so a
+param.sfo without TITLE_ID got the last app's title ID, passed the
+empty title ID check, and a folder install then removed that app's
+directory and copied the new content into it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Refuse an empty null-terminated param.sfo entry
+
+A UTF8_NULL entry of length 0 has no null byte to drop, and reading it
+took the end of an empty buffer minus one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Add the key table bound in 64 bits
+
+The key table start plus a key offset was added in 32 bits, so a
+param.sfo with a key table near 4 GB could wrap past the bound check.
+The data check below already adds in 64 bits.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Refuse a pkg or vci whose param.sfo has no usable ID
+
+The pkg and vci installers ignored whether the param.sfo was readable,
+and built the destination from its title ID before removing whatever was
+there. With app_info now starting empty, an unreadable param.sfo or one
+without TITLE_ID left an empty title ID, so the destination was ux0/app
+itself and the install removed every installed app.
+
+Both now refuse such a package: an unreadable param.sfo, an empty title
+ID (content ID for a theme), or a DLC content ID too short to take its
+label from.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Read a null-terminated param.sfo value up to its terminator
+
+A UTF8_NULL value dropped its last byte whether or not it was the
+terminator, so a value written without one lost its last character: a
+TITLE_ID of PCSE00001 became PCSE0000. It now ends at the first null
+byte, like the keys do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* packages: Remove the VCI staging folder when its param.sfo is rejected
+
+The new param.sfo check returned without removing VCI_TMP, which holds
+the carved gro0 image and the extracted app, as the later failures do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+---------
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 186d7f1740555dd60a2805b64728bb07f00682c7)
+---
+ vita3k/interface.cpp                   | 10 +++++++--
+ vita3k/packages/include/packages/sfo.h |  2 +-
+ vita3k/packages/src/pkg.cpp            | 16 +++++++++++++-
+ vita3k/packages/src/sfo.cpp            | 30 ++++++++++++++++++++------
+ vita3k/packages/src/vci.cpp            |  6 +++++-
+ 5 files changed, 52 insertions(+), 12 deletions(-)
+
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 8c98dda7..ebf20c13 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -182,7 +182,10 @@ static bool install_archive_content(EmuEnvState &emuenv, const ZipPtr &zip, cons
+ 
+     auto output_path{ emuenv.vita_fs_path / "ux0" };
+     if (mz_zip_reader_extract_file_to_callback(zip.get(), (content_path + sfo_path).c_str(), &write_to_buffer, &buffer, 0)) {
+-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
++        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
++            LOG_ERROR("{}{} is not a readable param.sfo, not installing it", content_path, sfo_path);
++            return false;
++        }
+         if (!set_content_path(emuenv, is_theme, output_path))
+             return false;
+     } else if (is_theme) {
+@@ -371,7 +374,10 @@ static bool install_content(EmuEnvState &emuenv, const fs::path &content_path) {
+     const auto is_theme = fs::exists(theme_path);
+     auto dst_path{ emuenv.vita_fs_path / "ux0" };
+     if (fs_utils::read_data(sfo_path, buffer)) {
+-        sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang);
++        if (!sfo::get_param_info(emuenv.app_info, buffer, emuenv.cfg.sys_lang)) {
++            LOG_ERROR("{} is not a readable param.sfo, not installing it", fs_utils::path_to_utf8(sfo_path));
++            return false;
++        }
+         if (!set_content_path(emuenv, is_theme, dst_path))
+             return false;
+ 
+diff --git a/vita3k/packages/include/packages/sfo.h b/vita3k/packages/include/packages/sfo.h
+index a2e1a30f..d4543455 100644
+--- a/vita3k/packages/include/packages/sfo.h
++++ b/vita3k/packages/include/packages/sfo.h
+@@ -97,5 +97,5 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content);
+  * @param param File buffer pointing to the `param.sfo` file to parse
+  * @param sys_lang System language. It is used to get translated strings from `param.sfo`
+  */
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang);
+ } // namespace sfo
+diff --git a/vita3k/packages/src/pkg.cpp b/vita3k/packages/src/pkg.cpp
+index 1c5a5bd0..37c4fa15 100644
+--- a/vita3k/packages/src/pkg.cpp
++++ b/vita3k/packages/src/pkg.cpp
+@@ -209,7 +209,21 @@ bool install_pkg(const fs::path &pkg_path, EmuEnvState &emuenv, std::string &p_z
+     fseek(infile, sfo_offset, SEEK_SET);
+     fread(sfo_buffer.data(), sfo_buffer.size(), 1, infile);
+     sfo::load(sfo_file, sfo_buffer);
+-    sfo::get_param_info(emuenv.app_info, sfo_buffer, emuenv.cfg.sys_lang);
++    if (!sfo::get_param_info(emuenv.app_info, sfo_buffer, emuenv.cfg.sys_lang)) {
++        LOG_ERROR("The param.sfo in {} is not readable, not installing it", fs_utils::path_to_utf8(pkg_path));
++        evp_cleanup();
++        fclose(infile);
++        return false;
++    }
++
++    const bool is_theme = type == PkgType::PKG_TYPE_VITA_THEME;
++    const std::string &dest_id = is_theme ? emuenv.app_info.app_content_id : emuenv.app_info.app_title_id;
++    if (dest_id.empty() || (type == PkgType::PKG_TYPE_VITA_DLC && emuenv.app_info.app_content_id.size() <= 20)) {
++        LOG_ERROR("The param.sfo in {} has no usable title or content ID, not installing it", fs_utils::path_to_utf8(pkg_path));
++        evp_cleanup();
++        fclose(infile);
++        return false;
++    }
+ 
+     if (type == PkgType::PKG_TYPE_VITA_DLC)
+         emuenv.app_info.app_content_id = emuenv.app_info.app_content_id.substr(20);
+diff --git a/vita3k/packages/src/sfo.cpp b/vita3k/packages/src/sfo.cpp
+index 4aa0b062..34723fbc 100644
+--- a/vita3k/packages/src/sfo.cpp
++++ b/vita3k/packages/src/sfo.cpp
+@@ -74,9 +74,11 @@ bool get_data_by_key(std::string &out_data, SfoFile &file, const std::string &ke
+     return true;
+ }
+ 
+-void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
++bool get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int sys_lang) {
++    app_info = {};
+     SfoFile sfo_handle;
+-    sfo::load(sfo_handle, param);
++    if (!sfo::load(sfo_handle, param))
++        return false;
+     sfo::get_data_by_key(app_info.app_version, sfo_handle, "APP_VER");
+     if (app_info.app_version[0] == '0')
+         app_info.app_version.erase(app_info.app_version.begin());
+@@ -94,15 +96,22 @@ void get_param_info(sfo::SfoAppInfo &app_info, const vfs::FileBuffer &param, int
+     std::replace(app_info.app_title.begin(), app_info.app_title.end(), '\n', ' ');
+     boost::trim(app_info.app_title);
+     sfo::get_data_by_key(app_info.app_title_id, sfo_handle, "TITLE_ID");
++    return true;
+ }
+ 
+ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+-    if (content.empty()) {
++    if (content.size() < sizeof(SfoHeader)) {
+         return false;
+     }
+ 
+     memcpy(&sfile.header, content.data(), sizeof(SfoHeader));
+ 
++    const uint64_t index_end = sizeof(SfoHeader) + static_cast<uint64_t>(sfile.header.tables_entries) * sizeof(SfoIndexTableEntry);
++    if (sfile.header.magic != 0x46535000 || index_end > sfile.header.key_table_start
++        || sfile.header.key_table_start > sfile.header.data_table_start || sfile.header.data_table_start > content.size()) {
++        return false;
++    }
++
+     sfile.entries.resize(sfile.header.tables_entries + 1);
+ 
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+@@ -114,6 +123,10 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+     // Parse each SFO entry and extract its associated key
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+         // Calculate the size of the key for the current entry by subtracting the offsets
++        if (sfile.entries[i].entry.key_offset >= sfile.entries[i + 1].entry.key_offset
++            || static_cast<uint64_t>(sfile.header.key_table_start) + sfile.entries[i + 1].entry.key_offset > sfile.header.data_table_start) {
++            return false;
++        }
+         uint32_t keySize = sfile.entries[i + 1].entry.key_offset - sfile.entries[i].entry.key_offset;
+ 
+         // Resize the 'key' data to hold the correct amount of characters for the key
+@@ -122,14 +135,17 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+         // Calculate the starting address of the key data in the content buffer
+         const auto key_begin = content.begin() + sfile.header.key_table_start + sfile.entries[i].entry.key_offset;
+ 
+-        // Extract the key data from the content buffer and assign it to 'key' as a string
+-        // Subtract 1 from keySize to avoid including the null terminator
+-        sfile.entries[i].data.first = std::string(key_begin, key_begin + keySize - 1);
++        sfile.entries[i].data.first = std::string(key_begin, std::find(key_begin, key_begin + keySize, '\0'));
+     }
+ 
+     // Parse each SFO entry and extract its associated data
+     for (uint32_t i = 0; i < sfile.header.tables_entries; i++) {
+         const uint32_t dataSize = sfile.entries[i].entry.data_len;
++        if (static_cast<uint64_t>(sfile.header.data_table_start) + sfile.entries[i].entry.data_offset + dataSize > content.size()
++            || (sfile.entries[i].entry.data_fmt == SfoDataFormat::UINT32_T && dataSize < sizeof(uint32_t))
++            || (sfile.entries[i].entry.data_fmt == SfoDataFormat::UTF8_NULL && dataSize == 0)) {
++            return false;
++        }
+ 
+         // Resize the destination string to match the data size
+         sfile.entries[i].data.second.resize(dataSize);
+@@ -153,7 +169,7 @@ bool load(SfoFile &sfile, const std::vector<uint8_t> &content) {
+             break;
+         case SfoDataFormat::UTF8_NULL:
+             // Interpret the data as a null-terminated UTF-8 string (exclude the null byte)
+-            sfile.entries[i].data.second = std::string(data.begin(), data.end() - 1);
++            sfile.entries[i].data.second = std::string(data.begin(), std::find(data.begin(), data.end(), '\0'));
+             break;
+         default:
+             // Unknown or unsupported data format
+diff --git a/vita3k/packages/src/vci.cpp b/vita3k/packages/src/vci.cpp
+index 4eb1f4f0..26f98c35 100644
+--- a/vita3k/packages/src/vci.cpp
++++ b/vita3k/packages/src/vci.cpp
+@@ -220,7 +220,11 @@ bool install_vci(const fs::path &vci_path, EmuEnvState &emuenv, const std::funct
+     }
+     vfs::FileBuffer param;
+     fs_utils::read_data(param_sfo, param);
+-    sfo::get_param_info(emuenv.app_info, param, emuenv.cfg.sys_lang);
++    if (!sfo::get_param_info(emuenv.app_info, param, emuenv.cfg.sys_lang) || emuenv.app_info.app_title_id.empty()) {
++        LOG_ERROR("VCI: param.sfo at {} is not readable or has no title ID", fs_utils::path_to_utf8(param_sfo));
++        fs::remove_all(staging);
++        return false;
++    }
+     LOG_INFO("Found {} [{}], category: {}, content id: {}", emuenv.app_info.app_title, emuenv.app_info.app_title_id, emuenv.app_info.app_category, emuenv.app_info.app_content_id);
+ 
+     // 8) Choose the ux0 destination (a cart image is always a full app)
+-- 
+2.54.0.windows.1
+

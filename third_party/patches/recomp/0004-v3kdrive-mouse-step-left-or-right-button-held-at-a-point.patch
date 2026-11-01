@@ -1,0 +1,47 @@
+diff --git a/tools/v3kdrive.py b/tools/v3kdrive.py
+index 3a8a0dd..5699066 100644
+--- a/tools/v3kdrive.py
++++ b/tools/v3kdrive.py
+@@ -37,6 +37,9 @@ Steps (comma separated):
+   frame:<path>      PNG of the frame at render resolution (front end, through the input pipe)
+   touch:<x>:<y>:ms  hold a finger on the front touchscreen at (x, y) of 960x544 (front end)
+   tdown:<x>:<y>     put the finger down and keep it there; tup lifts it
++  mouse:<l|r>:<x>:<y>:ms  hold a mouse button at (x, y) of 960x544, mapped onto the window's client
++                    area (window messages, no focus): the front end's left button is the front
++                    touchscreen, the right button the rear one
+   record:<n>:<dir>  save the next n rendered frames into dir (front end); returns at once
+   memdump:<addr>:<size>:<path>  write guest memory (hex address and size) to path (front end)
+   menu              open or close the front end's settings menu
+@@ -133,6 +136,22 @@ def key(hwnd, name, down):
+     user32.PostMessageW(hwnd, WM_KEYUP if not down else WM_KEYDOWN, vk, lparam)
+ 
+ 
++WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP = 0x200, 0x201, 0x202, 0x204, 0x205
++
++
++def mouse(hwnd, button, x, y, ms):
++    """Holds the left or right mouse button at (x, y) of the 960x544 screen for ms (posted messages)."""
++    rc = wintypes.RECT()
++    user32.GetClientRect(hwnd, ctypes.byref(rc))
++    px, py = int(x * rc.right / 960), int(y * rc.bottom / 544)
++    pos = (py << 16) | (px & 0xFFFF)
++    down, up, flag = (WM_LBUTTONDOWN, WM_LBUTTONUP, 1) if button == "l" else (WM_RBUTTONDOWN, WM_RBUTTONUP, 2)
++    user32.PostMessageW(hwnd, WM_MOUSEMOVE, 0, pos)
++    user32.PostMessageW(hwnd, down, flag, pos)
++    time.sleep(ms / 1000)
++    user32.PostMessageW(hwnd, up, 0, pos)
++
++
+ def capture(hwnd, path):
+     """PrintWindow(PW_RENDERFULLCONTENT) of the client area to a PNG; works without focus."""
+     import struct, zlib
+@@ -312,6 +331,9 @@ def run(steps, fps_csv):
+             pad.touch(float(x), float(y))
+         elif step == "tup":
+             pad.touch(None, None)
++        elif step.startswith("mouse:"):
++            _, b, x, y, ms = step.split(":")
++            mouse(hwnd, b, float(x), float(y), int(ms)); time.sleep(0.1)
+         elif step.startswith("touch:"):
+             _, x, y, ms = step.split(":")
+             pad.touch(float(x), float(y)); s.sleep(int(ms)); pad.touch(None, None); time.sleep(0.1)

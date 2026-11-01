@@ -1,0 +1,59 @@
+From 1e492dfaa5b9d7ecdcf521b02aacdf49fa0baf46 Mon Sep 17 00:00:00 2001
+From: Zangetsu38 <dante38@free.fr>
+Date: Sun, 18 Oct 2026 05:20:24 +0200
+Subject: [PATCH 55/58] shader: Correct USSE exponentials and scalar dual
+ results.
+
+- Translate VEXP/FEXP and VLOG/FLOG using base-2 SPIR-V operations.
+- Preserve the existing NaN-to-one exponential behavior.
+- Replicate scalar VDUAL results to the destination write mask.
+- Bump the shader cache version to regenerate translated programs.
+
+Co-authored-by: nckstwrt <nick.g.stewart@gmail.com>
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+(cherry picked from commit c23da14667f77f95a960f4505aebeaaa53344a10)
+---
+ vita3k/shader/include/shader/spirv_recompiler.h | 3 ++-
+ vita3k/shader/src/translator/alu.cpp            | 5 ++++-
+ 2 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/vita3k/shader/include/shader/spirv_recompiler.h b/vita3k/shader/include/shader/spirv_recompiler.h
+index a18441d9..b27b5686 100644
+--- a/vita3k/shader/include/shader/spirv_recompiler.h
++++ b/vita3k/shader/include/shader/spirv_recompiler.h
+@@ -40,7 +40,8 @@ static constexpr int COLOR_ATTACHMENT_RAW_TEXTURE_SLOT_IMAGE = 3;
+ // 21 (vekta-mercenary): a texture that is part of a surface is sampled within that part
+ // 22 (vekta-mercenary): buffers loaded into registers fill them even when no uniform parameter names them
+ // 23 (ss-delta): COLOR0 and COLOR1 vertex outputs clamped to [0, 1] with clamp_color_varyings
+-static constexpr uint32_t CURRENT_VERSION = 23;
++// 24 (upstream c23da146, LBV): scalar dual results corrected
++static constexpr uint32_t CURRENT_VERSION = 24;
+ // fragment shader using the rendering surface as a storage image (because of shader interlock) have a line
+ // layout (constant_id = GAMMA_CORRECTION_SPECIALIZATIO_ID) const bool is_srgb = false;
+ // Setting this constant to true performs gamma correction in the shader
+diff --git a/vita3k/shader/src/translator/alu.cpp b/vita3k/shader/src/translator/alu.cpp
+index 292dd283..1c80f668 100644
+--- a/vita3k/shader/src/translator/alu.cpp
++++ b/vita3k/shader/src/translator/alu.cpp
+@@ -1887,7 +1887,7 @@ bool USSETranslatorVisitor::vdual(
+             break;
+         }
+         case Opcode::FEXP: {
+-            // hack: set exp(nan) = 1.0 (see VEXP)
++            // Preserve exp2(NaN) = 1.0 (see VEXP).
+             const spv::Id source = load(ops[0], write_mask_source);
+             result = m_b.createBuiltinCall(m_b.getTypeId(source), std_builtins, m_features.exp_log_base2 ? GLSLstd450Exp2 : GLSLstd450Exp, { source });
+             const int num_comp = m_b.getNumComponents(source);
+@@ -1939,6 +1939,9 @@ bool USSETranslatorVisitor::vdual(
+             return spv::NoResult;
+         }
+ 
++        if (m_b.getNumComponents(result) == 1)
++            result = postprocess_dot_result_for_store(m_b, result, write_mask_dest);
++
+         disasm_str += fmt::format("{} {}", disasm::opcode_str(code), disasm::operand_to_str(dest, write_mask_dest));
+ 
+         for (Operand &op : ops)
+-- 
+2.54.0.windows.1
+

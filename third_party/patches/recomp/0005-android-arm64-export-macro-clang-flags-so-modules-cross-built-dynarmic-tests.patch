@@ -1,0 +1,116 @@
+diff --git a/recomp/CMakeLists.txt b/recomp/CMakeLists.txt
+index d091af5..db63535 100644
+--- a/recomp/CMakeLists.txt
++++ b/recomp/CMakeLists.txt
+@@ -43,6 +43,10 @@ foreach(module IN LISTS RECOMP_MODULES)
+     if(MSVC)
+         # huge functions: /bigobj; keep optimisation moderate (compile time and memory)
+         target_compile_options(gen_${module} PRIVATE /bigobj /O1 /w)
++    else()
++        # clang (Android NDK): the same moderate optimisation; position-independent for the shared module
++        target_compile_options(gen_${module} PRIVATE -O1 -g0 -w)
++        set_target_properties(gen_${module} PROPERTIES POSITION_INDEPENDENT_CODE ON CXX_VISIBILITY_PRESET hidden)
+     endif()
+     if(RECOMP_COUNT_INSNS)
+         target_compile_definitions(gen_${module} PRIVATE RECOMP_COUNT_INSNS)
+@@ -54,6 +58,12 @@ foreach(module IN LISTS RECOMP_MODULES)
+     add_library(${RECOMP_DLL_PREFIX}${module} SHARED runtime/aot_dll.cpp)
+     target_include_directories(${RECOMP_DLL_PREFIX}${module} PRIVATE runtime)
+     target_link_libraries(${RECOMP_DLL_PREFIX}${module} PRIVATE gen_${module})
++    if(NOT WIN32)
++        # lib<prefix><module>.so: only armrecomp_aot_init is exported, so modules loaded side by side never
++        # share each other's runtime globals (g_guest_base, the host hooks)
++        set_target_properties(${RECOMP_DLL_PREFIX}${module} PROPERTIES CXX_VISIBILITY_PRESET hidden)
++        target_link_options(${RECOMP_DLL_PREFIX}${module} PRIVATE -Wl,--gc-sections -Wl,--no-undefined -Wl,--exclude-libs,ALL)
++    endif()
+ endforeach()
+ 
+ # --- per-instruction comparison tests against dynarmic ------------------------------------------
+@@ -66,7 +76,11 @@ set(VITA3K_BUILD "" CACHE PATH "Vita3K fork build tree (the tests' dynarmic libr
+ set(VITA3K_CONFIG "RelWithDebInfo" CACHE STRING "")
+ set(test_dir "${GENERATED_DIR}/tests/${RECOMP_TEST_MODULE}")
+ if(RECOMP_TESTS AND EXISTS "${test_dir}/tests.cpp")
+-    foreach(var VITA3K_SRC VITA3K_BUILD)
++    set(needed VITA3K_SRC)
++    if(MSVC)
++        list(APPEND needed VITA3K_BUILD) # cross builds make their own dynarmic (below)
++    endif()
++    foreach(var IN LISTS needed)
+         if(NOT ${var} OR NOT IS_DIRECTORY "${${var}}")
+             message(FATAL_ERROR "recomp_tests needs ${var} (now '${${var}}'): pass -D${var}=<dir>, "
+                                 "or -DRECOMP_TESTS=OFF")
+@@ -78,13 +92,28 @@ if(RECOMP_TESTS AND EXISTS "${test_dir}/tests.cpp")
+         "${VITA3K_SRC}/external/dynarmic/src"
+         "${VITA3K_SRC}/external/dynarmic/externals/mcl/include"
+         "${VITA3K_SRC}/external/fmt/include")
+-    set(dyn "${VITA3K_BUILD}/external/dynarmic")
+-    target_link_libraries(recomp_tests PRIVATE
+-        "${dyn}/src/dynarmic/${VITA3K_CONFIG}/dynarmic.lib"
+-        "${dyn}/externals/mcl/src/${VITA3K_CONFIG}/mcl.lib"
+-        "${dyn}/externals/zydis/${VITA3K_CONFIG}/Zydis.lib"
+-        "${dyn}/externals/zydis/zycore/${VITA3K_CONFIG}/Zycore.lib"
+-        "${VITA3K_BUILD}/external/fmt/${VITA3K_CONFIG}/fmt.lib")
++    if(MSVC)
++        set(dyn "${VITA3K_BUILD}/external/dynarmic")
++        target_link_libraries(recomp_tests PRIVATE
++            "${dyn}/src/dynarmic/${VITA3K_CONFIG}/dynarmic.lib"
++            "${dyn}/externals/mcl/src/${VITA3K_CONFIG}/mcl.lib"
++            "${dyn}/externals/zydis/${VITA3K_CONFIG}/Zydis.lib"
++            "${dyn}/externals/zydis/zycore/${VITA3K_CONFIG}/Zycore.lib"
++            "${VITA3K_BUILD}/external/fmt/${VITA3K_CONFIG}/fmt.lib")
++    else()
++        # cross builds (Android arm64): dynarmic from the fork's source, built here with its bundled externals
++        # (oaknut for the arm64 backend) and the fork's header-only Boost; VITA3K_BUILD is not used
++        enable_language(C)
++        enable_language(ASM)
++        set(DYNARMIC_TESTS OFF CACHE BOOL "" FORCE)
++        set(DYNARMIC_FRONTENDS "A32" CACHE STRING "" FORCE)
++        set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
++        set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
++        set(DYNARMIC_USE_BUNDLED_EXTERNALS ON CACHE BOOL "" FORCE)
++        set(Boost_INCLUDE_DIR "${VITA3K_SRC}/external/boost" CACHE PATH "" FORCE)
++        add_subdirectory("${VITA3K_SRC}/external/dynarmic" dynarmic EXCLUDE_FROM_ALL)
++        target_link_libraries(recomp_tests PRIVATE dynarmic)
++    endif()
+     if(MSVC)
+         target_compile_options(recomp_tests PRIVATE /bigobj /EHsc)
+     endif()
+diff --git a/recomp/runtime/aot_dll.cpp b/recomp/runtime/aot_dll.cpp
+index 571afa6..e959bd0 100644
+--- a/recomp/runtime/aot_dll.cpp
++++ b/recomp/runtime/aot_dll.cpp
+@@ -32,7 +32,15 @@ void unsupported(GuestContext *ctx, uint32_t pc) {
+ 
+ } // namespace armrecomp
+ 
+-extern "C" __declspec(dllexport) const armrecomp::AotModule *armrecomp_aot_init(const armrecomp::AotHost *host) {
++// the one exported symbol: a DLL export on Windows, a default-visibility ELF symbol elsewhere (Android .so, built
++// with hidden visibility so each module keeps its own runtime globals)
++#ifdef _WIN32
++#define ARMRECOMP_EXPORT __declspec(dllexport)
++#else
++#define ARMRECOMP_EXPORT __attribute__((visibility("default")))
++#endif
++
++extern "C" ARMRECOMP_EXPORT const armrecomp::AotModule *armrecomp_aot_init(const armrecomp::AotHost *host) {
+     using namespace armrecomp;
+     if (!host || host->abi_version != AOT_ABI_VERSION || host->context_size != sizeof(GuestContext))
+         return nullptr;
+diff --git a/recomp/runtime/armrecomp.h b/recomp/runtime/armrecomp.h
+index 7e090a3..968e47f 100644
+--- a/recomp/runtime/armrecomp.h
++++ b/recomp/runtime/armrecomp.h
+@@ -79,7 +79,13 @@ void wr64(uint32_t a, uint64_t v);
+ #ifndef RECOMP_CUSTOM_MEMORY
+ template <typename T>
+ inline bool cas(uint32_t a, T expected, T desired) {
++#if defined(__clang__) || defined(__GNUC__)
++    // the builtin, not std::atomic_ref: the Android NDK's libc++ (LLVM 18) has no atomic_ref
++    return __atomic_compare_exchange_n(reinterpret_cast<T *>(g_guest_base + a), &expected, desired, false,
++                                       __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++#else
+     return std::atomic_ref<T>(*reinterpret_cast<T *>(g_guest_base + a)).compare_exchange_strong(expected, desired);
++#endif
+ }
+ #else
+ template <typename T>

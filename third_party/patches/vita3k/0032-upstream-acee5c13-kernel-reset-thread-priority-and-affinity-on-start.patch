@@ -1,0 +1,102 @@
+From a20897e3ed7a6a02840c18ea6423b512e7dbe448 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Mon, 19 Oct 2026 11:20:14 +0900
+Subject: [PATCH 32/52] kernel: reset thread priority and affinity on start
+
+(cherry picked from commit acee5c13e11fd3e8ee2d3a1960ece8d7568a36e8)
+---
+ .../include/kernel/thread/thread_state.h      |  5 +++-
+ vita3k/kernel/src/thread.cpp                  | 25 ++++++++++++++-----
+ 2 files changed, 23 insertions(+), 7 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index cedc48f0..4c4694be 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -76,7 +76,7 @@ struct ThreadState {
+     // The pointer is fixed. The registers are only touched by the thread itself, or while
+     // something holds it.
+     const CPUStatePtr cpu;
+-    // The priority and the cores it was created with
++    // The priority and the cores it was created with, which each start goes back to
+     const int init_priority;
+     const SceInt32 init_affinity_mask;
+     // The registers each run starts with
+@@ -235,6 +235,9 @@ private:
+     void request_ending(Ending how) { ending = std::max(ending, how); }
+     // Ends the thread without its end handler, whatever its status
+     void request_removal();
++    // Set the priority or the affinity mask and the TLS slot that shows it
++    void set_priority(int new_priority);
++    void set_affinity_mask(SceInt32 new_affinity_mask);
+     // Starts a dormant thread at entry, like start() does at its entry point. Takes mutex.
+     int start_at(Address entry, SceSize arglen, Ptr<void> argp, bool run_entry_callback);
+     // Whether a callback of this thread was notified and hasn't run yet
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index bf626602..a4aaeab8 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -124,6 +124,9 @@ int ThreadState::start_at(Address entry, SceSize arglen, const Ptr<void> argp, b
+ 
+     run_start_callback = run_entry_callback;
+     returned_value = SCE_KERNEL_ERROR_NOT_DORMANT;
++    // Each run starts at the priority and on the cores the thread was created with
++    set_priority(init_priority);
++    set_affinity_mask(init_affinity_mask);
+     load_context(*cpu, init_cpu_ctx);
+     // A thread starts with TPIDRURW at 0, also when it starts again
+     write_tpidrurw(*cpu, 0);
+@@ -650,9 +653,9 @@ SceKernelThreadInfo ThreadState::info() {
+     info.attr = attr;
+     info.stack = Ptr<void>(stack.get());
+     info.stackSize = stack_size;
+-    info.initPriority = priority; // Todo Give only current priority
++    info.initPriority = init_priority;
+     info.currentPriority = priority;
+-    info.initCpuAffinityMask = affinity_mask; // Todo Give init affinity
++    info.initCpuAffinityMask = init_affinity_mask;
+     info.currentCpuAffinityMask = affinity_mask;
+     info.entry = SceKernelThreadEntry(entry_point);
+     info.status = std::to_underlying(status);
+@@ -670,11 +673,16 @@ int ThreadState::get_priority() const {
+ 
+ int ThreadState::change_priority(int new_priority) {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    const int old_priority = std::exchange(priority, new_priority);
+-    tls.get_ptr<int>().get(mem)[TLS_CURRENT_PRIORITY] = new_priority;
++    const int old_priority = priority;
++    set_priority(new_priority);
+     return old_priority;
+ }
+ 
++void ThreadState::set_priority(int new_priority) {
++    priority = new_priority;
++    tls.get_ptr<int>().get(mem)[TLS_CURRENT_PRIORITY] = new_priority;
++}
++
+ SceInt32 ThreadState::get_affinity_mask() const {
+     const std::lock_guard<std::mutex> lock(mutex);
+     return affinity_mask;
+@@ -682,11 +690,16 @@ SceInt32 ThreadState::get_affinity_mask() const {
+ 
+ SceInt32 ThreadState::change_affinity_mask(SceInt32 new_affinity_mask) {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    const SceInt32 old_affinity_mask = std::exchange(affinity_mask, new_affinity_mask);
+-    tls.get_ptr<int>().get(mem)[TLS_CPU_AFFINITY_MASK] = new_affinity_mask;
++    const SceInt32 old_affinity_mask = affinity_mask;
++    set_affinity_mask(new_affinity_mask);
+     return old_affinity_mask;
+ }
+ 
++void ThreadState::set_affinity_mask(SceInt32 new_affinity_mask) {
++    affinity_mask = new_affinity_mask;
++    tls.get_ptr<int>().get(mem)[TLS_CPU_AFFINITY_MASK] = new_affinity_mask;
++}
++
+ Address ThreadState::stack_top() const {
+     return stack.get() + stack_size;
+ }
+-- 
+2.54.0.windows.1
+

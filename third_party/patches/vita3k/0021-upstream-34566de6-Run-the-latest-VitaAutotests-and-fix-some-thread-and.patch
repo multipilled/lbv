@@ -1,0 +1,748 @@
+From 4a8e53de49332ee945c73af2bb6a9b250e25d678 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Wed, 14 Oct 2026 22:56:33 +0900
+Subject: [PATCH 21/52] Run the latest VitaAutotests, and fix some thread and
+ callback behavior found (#4236)
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the VitaAutotests commit that adds 47 more tests,
+and give each of them its outcome on Vita3K in expectations.txt. Four
+of them pass, the others fail, crash or time out on what each line
+says. The runner now finds tests by their .expected files, since the
+suite also has the source of a module under tests/.
+
+* cpu: handle TPIDRURW
+
+User code may read and write TPIDRURW with MRC and MCR, but Vita3K
+only handled TPIDRURO, so the JIT asserted on the first access.
+TPIDRURW now has its own value per thread. It is 0 when a thread
+starts, also when it starts again, and the thread gets its own value
+back after a callback. _sceKernelGetThreadContextForVM reports it
+instead of TPIDRURO.
+
+* kernel: start threads and callbacks with the VFP state of a Vita
+
+Threads started with FPSCR 0, where a Vita starts every thread with
+0x03000000, round to nearest with flush-to-zero and default NaN. A
+callback ran with the thread's FPSCR and VFP exception setting, where
+on a Vita it starts with those of a new thread and the thread gets its
+own back after it. The other guest calls Vita3K makes from HLE code,
+like library callbacks, keep the caller's state as before.
+
+* kernel: fix thread signal timeouts and targets
+
+sceKernelWaitSignal ignored its timeout and waited until a signal came,
+and sceKernelSendSignal used the target without checking it, so a
+signal to a UID that isn't a thread crashed Vita3K. A wait now ends
+with WAIT_TIMEOUT when its timeout passes, writes back the time left
+when it waited, and leaves the timeout alone when a signal was already
+there. A signal to UID 0 fails with ILLEGAL_THREAD_ID and one to what
+isn't a thread with UNKNOWN_THREAD_ID, as on a Vita.
+
+* kernel: check thread attributes and report them in thread info
+
+sceKernelCreateThread took any attributes and thread info always
+reported 0, and sceKernelChangeCurrentThreadAttr was unimplemented. A
+Vita creates threads only with the attributes 0x2000, 0x01000000,
+0x04000000 and 0x80000000, fails with ILLEGAL_ATTR for any other, and
+reports the attributes given plus 0x80000000, which every user thread
+has. sceKernelChangeCurrentThreadAttr takes only 0x01000000 and
+0x80000000, and thread info doesn't show a change to either.
+
+* kernel: leave TLS slot 0 at 0 for a new thread
+
+Vita3K wrote 1 to TLS slot 0 as a stub process ID that nothing reads,
+where a new thread on a Vita finds 0.
+
+* kernel: report pending callbacks and clear taken callback arguments
+
+Thread info always reported 0 in fNotifyCallback, where a Vita reports
+1 for a waiting thread with a notified callback that hasn't run yet. A
+callback that runs takes its notifications, and its info still showed
+the last argument, where on a Vita it reads 0 like the count.
+
+Each thread now counts its callbacks with notifications they haven't
+run for, in place of the flag that woke its waits, so a callback that
+was cancelled or deleted no longer counts as notified.
+
+* kernel: delete a thread's callbacks when it ends
+
+The callbacks a thread created outlived it, so another thread could
+still notify and run them. On a Vita they go away when the thread ends,
+whether it returns, exits or deletes itself, and their pending
+notifications never run.
+
+(cherry picked from commit 34566de6377723bf85f4570303b7293ebd37fd8d)
+---
+ vita3k/cpu/include/cpu/functions.h            |  2 +
+ vita3k/cpu/include/cpu/impl/dynarmic_cpu.h    |  3 +
+ vita3k/cpu/include/cpu/impl/interface.h       |  3 +
+ vita3k/cpu/src/cpu.cpp                        |  8 ++
+ vita3k/cpu/src/dynarmic_cpu.cpp               | 28 +++++++
+ vita3k/kernel/include/kernel/callback.h       |  4 +-
+ .../include/kernel/thread/thread_state.h      | 30 +++++--
+ vita3k/kernel/include/kernel/types.h          |  2 +-
+ vita3k/kernel/src/callback.cpp                | 23 +++--
+ vita3k/kernel/src/thread.cpp                  | 84 +++++++++++++------
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 30 ++++---
+ .../modules/SceKernelThreadMgr/SceThreadmgr.h |  4 +-
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  | 14 ++--
+ 13 files changed, 174 insertions(+), 61 deletions(-)
+
+diff --git a/vita3k/cpu/include/cpu/functions.h b/vita3k/cpu/include/cpu/functions.h
+index e9a319f4..37015294 100644
+--- a/vita3k/cpu/include/cpu/functions.h
++++ b/vita3k/cpu/include/cpu/functions.h
+@@ -39,11 +39,13 @@ uint32_t read_sp(CPUState &state);
+ uint32_t read_pc(CPUState &state);
+ uint32_t read_lr(CPUState &state);
+ uint32_t read_tpidruro(CPUState &state);
++uint32_t read_tpidrurw(CPUState &state);
+ void write_reg(CPUState &state, size_t index, uint32_t value);
+ void write_sp(CPUState &state, uint32_t value);
+ void write_pc(CPUState &state, uint32_t value);
+ void write_lr(CPUState &state, uint32_t value);
+ void write_tpidruro(CPUState &state, uint32_t value);
++void write_tpidrurw(CPUState &state, uint32_t value);
+ bool is_thumb_mode(CPUState &state);
+ CPUContext save_context(CPUState &state);
+ void load_context(CPUState &state, const CPUContext &ctx);
+diff --git a/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h b/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
+index 34c0a6b7..5e7b6b38 100644
+--- a/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
++++ b/vita3k/cpu/include/cpu/impl/dynarmic_cpu.h
+@@ -89,6 +89,9 @@ public:
+     uint32_t get_tpidruro() override;
+     void set_tpidruro(uint32_t val) override;
+ 
++    uint32_t get_tpidrurw() override;
++    void set_tpidrurw(uint32_t val) override;
++
+     float get_float_reg(uint8_t idx) override;
+     void set_float_reg(uint8_t idx, float val) override;
+ 
+diff --git a/vita3k/cpu/include/cpu/impl/interface.h b/vita3k/cpu/include/cpu/impl/interface.h
+index 56c3457d..e3fe5470 100644
+--- a/vita3k/cpu/include/cpu/impl/interface.h
++++ b/vita3k/cpu/include/cpu/impl/interface.h
+@@ -46,6 +46,9 @@ struct CPUInterface {
+     virtual uint32_t get_tpidruro() = 0;
+     virtual void set_tpidruro(uint32_t val) = 0;
+ 
++    virtual uint32_t get_tpidrurw() = 0;
++    virtual void set_tpidrurw(uint32_t val) = 0;
++
+     virtual float get_float_reg(uint8_t idx) = 0;
+     virtual void set_float_reg(uint8_t idx, float val) = 0;
+ 
+diff --git a/vita3k/cpu/src/cpu.cpp b/vita3k/cpu/src/cpu.cpp
+index 8bc9afac..306c6dae 100644
+--- a/vita3k/cpu/src/cpu.cpp
++++ b/vita3k/cpu/src/cpu.cpp
+@@ -121,6 +121,10 @@ uint32_t read_tpidruro(CPUState &state) {
+     return state.cpu->get_tpidruro();
+ }
+ 
++uint32_t read_tpidrurw(CPUState &state) {
++    return state.cpu->get_tpidrurw();
++}
++
+ void write_reg(CPUState &state, size_t index, uint32_t value) {
+     state.cpu->set_reg(index, value);
+ }
+@@ -141,6 +145,10 @@ void write_tpidruro(CPUState &state, uint32_t value) {
+     state.cpu->set_tpidruro(value);
+ }
+ 
++void write_tpidrurw(CPUState &state, uint32_t value) {
++    state.cpu->set_tpidrurw(value);
++}
++
+ bool is_thumb_mode(CPUState &state) {
+     return state.cpu->is_thumb_mode();
+ }
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index 2d71900f..9e4b7606 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -43,6 +43,7 @@
+ 
+ class ArmDynarmicCP15 : public Dynarmic::A32::Coprocessor {
+     uint32_t tpidruro;
++    uint32_t tpidrurw;
+     uint32_t sctlr;
+     uint32_t dacr;
+ 
+@@ -51,6 +52,7 @@ public:
+ 
+     explicit ArmDynarmicCP15()
+         : tpidruro(0)
++        , tpidrurw(0)
+         , sctlr(0)
+         , dacr(0) {
+     }
+@@ -70,6 +72,11 @@ public:
+             return &tpidruro;
+         }
+ 
++        // MCR p15, 0, Rt, c13, c0, 2: write TPIDRURW
++        if (!two && CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 2) {
++            return &tpidrurw;
++        }
++
+         // MCR p15, 0, Rt, c1, c0, 0 — write SCTLR
+         if (!two && CRn == CoprocReg::C1 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 0) {
+             return &sctlr;
+@@ -95,6 +102,11 @@ public:
+             return &tpidruro;
+         }
+ 
++        // MRC p15, 0, Rt, c13, c0, 2: read TPIDRURW
++        if (!two && CRn == CoprocReg::C13 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 2) {
++            return &tpidrurw;
++        }
++
+         // MRC p15, 0, Rt, c1, c0, 0 — read SCTLR
+         if (!two && CRn == CoprocReg::C1 && CRm == CoprocReg::C0 && opc1 == 0 && opc2 == 0) {
+             return &sctlr;
+@@ -130,6 +142,14 @@ public:
+     uint32_t get_tpidruro() const {
+         return tpidruro;
+     }
++
++    void set_tpidrurw(uint32_t tpidrurw) {
++        this->tpidrurw = tpidrurw;
++    }
++
++    uint32_t get_tpidrurw() const {
++        return tpidrurw;
++    }
+ };
+ 
+ class ArmDynarmicCallback : public Dynarmic::A32::UserCallbacks {
+@@ -997,6 +1017,14 @@ void DynarmicCPU::set_tpidruro(uint32_t val) {
+     cp15->set_tpidruro(val);
+ }
+ 
++uint32_t DynarmicCPU::get_tpidrurw() {
++    return cp15->get_tpidrurw();
++}
++
++void DynarmicCPU::set_tpidrurw(uint32_t val) {
++    cp15->set_tpidrurw(val);
++}
++
+ void DynarmicCPU::set_pc(uint32_t val) {
+     if (val & 1) {
+         set_cpsr(get_cpsr() | 0x20);
+diff --git a/vita3k/kernel/include/kernel/callback.h b/vita3k/kernel/include/kernel/callback.h
+index af2a384d..e4b19efb 100644
+--- a/vita3k/kernel/include/kernel/callback.h
++++ b/vita3k/kernel/include/kernel/callback.h
+@@ -26,6 +26,8 @@
+ struct ThreadState;
+ typedef std::shared_ptr<ThreadState> ThreadStatePtr;
+ 
++// Lock order: a callback's lock, then its owner thread's mutex. Code that holds a thread's mutex
++// must not take the lock of a callback.
+ class Callback final : public WithUidClass<KernelObject, UidClass::callback> {
+ public:
+     // What the callback function receives about the notifications since it last ran
+@@ -63,7 +65,7 @@ public:
+ private:
+     // Drops the pending notifications, so the callback never runs again
+     void on_delete() override;
+-    // Clears the notifications. The lock must be held.
++    // Clears the notifications and tells the owner if there were any. The lock must be held.
+     void reset();
+ 
+     const std::weak_ptr<ThreadState> owner; // Thread that created this callback, woken when it is notified
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index ff7eaffc..30d70281 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -40,6 +40,15 @@ typedef std::unique_ptr<CPUState, std::function<void(CPUState *)>> CPUStatePtr;
+ typedef std::function<void(CPUState &, uint32_t, SceUID)> CallImport;
+ typedef std::function<std::string(Address)> ResolveNIDName;
+ 
++// The attribute of every user thread, which thread info always reports
++constexpr SceUInt32 THREAD_ATTR_USER = 0x80000000U;
++// Attributes a thread may be created with, which the Vita Development Wiki calls
++// SCE_KERNEL_THREAD_ATTR_NOUSE_VFP and SCE_KERNEL_THREAD_ATTR_VM
++constexpr SceUInt32 THREAD_ATTR_NOUSE_VFP = 0x01000000U;
++constexpr SceUInt32 THREAD_ATTR_VM = 0x04000000U;
++// Another attribute a Vita accepts for a thread, with no known name or effect
++constexpr SceUInt32 THREAD_ATTR_UNKNOWN_2000 = 0x00002000U;
++
+ // Values are what sceKernelGetThreadInfo reports
+ enum class ThreadStatus : SceUInt32 {
+     running = SCE_KERNEL_THREAD_STATUS_RUNNING,
+@@ -58,6 +67,8 @@ struct ThreadState {
+     int stack_size;
+     Block tls;
+ 
++    // What thread info reports, the creation attributes and THREAD_ATTR_USER
++    SceUInt32 attr = THREAD_ATTR_USER;
+     int priority;
+     SceInt32 affinity_mask;
+     uint64_t start_tick;
+@@ -87,7 +98,8 @@ struct ThreadState {
+     void run_loop();
+ 
+     // this function must be called from the thread itself (inside a svc call)
+-    uint32_t run_callback(Address callback_address, const std::vector<uint32_t> &args);
++    // With fresh_vfp_state, the call starts with the FPSCR and VFP exception setting of a new thread
++    uint32_t run_callback(Address callback_address, const std::vector<uint32_t> &args, bool fresh_vfp_state = false);
+ 
+     // this function is called from another thread when this one is dormant
+     // it is only used for module loading and gxm display queue right now
+@@ -96,8 +108,8 @@ struct ThreadState {
+ 
+     // Blocks this thread until the deadline passes.
+     [[nodiscard]] WaitResult delay_until(Deadline deadline, bool callbacks);
+-    // Blocks this thread until a signal is sent to it.
+-    [[nodiscard]] WaitResult wait_for_signal(bool callbacks);
++    // Blocks this thread until a signal is sent to it or the timeout passes, writing the time left back.
++    [[nodiscard]] WaitResult wait_for_signal(SceUInt32 *timeout, bool callbacks);
+     // Sends a signal to this thread. Fails if the previous one was not consumed yet.
+     SceInt32 send_signal();
+     // Blocks waiter until this thread becomes dormant, then writes its exit status to exit_status.
+@@ -112,10 +124,14 @@ struct ThreadState {
+ 
+     // Runs the notified callbacks of this thread and returns how many ran. Called by the thread itself.
+     SceUInt32 process_callbacks();
+-    // Tells this thread that one of its callbacks was notified, so a wait with callbacks runs it.
+-    void notify_callbacks();
+     // Adds a callback this thread created. Called by the thread itself.
+     void add_callback(const CallbackPtr &cb);
++    // Counts a callback of this thread that was notified and hasn't run for it yet, waking a wait
++    // with callbacks, and stops counting it. Called by the callback with its lock held.
++    void add_notified_callback();
++    void remove_notified_callback();
++    // Whether a callback of this thread was notified and hasn't run yet. Called with mutex held.
++    bool callbacks_notified() const { return notified_callbacks > 0; }
+ 
+     void suspend();
+     void resume(bool step = false);
+@@ -155,8 +171,8 @@ private:
+     bool signal_pending = false;
+     // Set by wake() and consumed by the next wait().
+     bool wake_pending = false;
+-    // Set by notify_callbacks() and cleared when the callbacks run.
+-    bool callbacks_pending = false;
++    // Callbacks of this thread with notifications they haven't run for.
++    SceUInt32 notified_callbacks = 0;
+     // Set while the thread runs its callbacks. They don't nest.
+     bool is_processing_callbacks = false;
+     // Callbacks this thread created, in creation order. The kernel owns them. Only this thread touches the list.
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index b9761ea3..0169b227 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -611,7 +611,7 @@ enum SceSysmoduleInternalModuleId : uint32_t {
+ 
+ // Indexes in thread local storage (TLS) for system data. It is used mostly by libkernel.
+ enum TlsItems {
+-    TLS_PROCESS_ID = 0,
++    TLS_PROCESS_ID = 0, // unused, and 0 when a thread is created, as on a Vita
+     TLS_THREAD_ID = 1,
+     TLS_SP_TOP = 2,
+     TLS_SP_BOTTOM = 3,
+diff --git a/vita3k/kernel/src/callback.cpp b/vita3k/kernel/src/callback.cpp
+index dd9d732e..4af3b9c3 100644
+--- a/vita3k/kernel/src/callback.cpp
++++ b/vita3k/kernel/src/callback.cpp
+@@ -28,16 +28,16 @@ Callback::Callback(const ThreadStatePtr &owner, const std::string &name, Ptr<Sce
+     , owner(owner) {}
+ 
+ void Callback::notify(SceUID notifier_id, SceInt32 notify_arg) {
+-    {
+-        const auto guard = lock();
+-        if (!guard)
+-            return;
+-        this->notifier_id = notifier_id;
+-        this->notification_arg = notify_arg;
+-        this->num_notifications++;
++    const auto guard = lock();
++    if (!guard)
++        return;
++    this->notifier_id = notifier_id;
++    this->notification_arg = notify_arg;
++    // The owner already counts a callback with notifications, and only the first one wakes it
++    if (this->num_notifications++ == 0) {
++        if (const ThreadStatePtr thread = owner.lock())
++            thread->add_notified_callback();
+     }
+-    if (const ThreadStatePtr thread = owner.lock())
+-        thread->notify_callbacks();
+ }
+ 
+ void Callback::event_notify(SceUID notifier_id) {
+@@ -84,6 +84,11 @@ std::optional<Callback::Notification> Callback::take_notification() {
+ }
+ 
+ void Callback::reset() {
++    if (this->num_notifications != 0) {
++        if (const ThreadStatePtr thread = owner.lock())
++            thread->remove_notified_callback();
++    }
+     this->num_notifications = 0;
++    this->notification_arg = 0;
+     this->notifier_id = SCE_UID_INVALID_UID;
+ }
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index fede2ad4..1afe9ed1 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -33,6 +33,8 @@
+ 
+ // Set in the wait type of a wait that runs callbacks
+ constexpr SceUInt32 WAITTYPE_CB_BIT = 0x80000000U;
++// The FPSCR a thread starts with: round to nearest, flush-to-zero and default NaN
++constexpr uint32_t INITIAL_FPSCR = 0x03000000U;
+ 
+ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option = nullptr) {
+     constexpr size_t KERNEL_TLS_SIZE = 0x800;
+@@ -87,7 +89,6 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+ 
+     int *tls_array = tls.get_ptr<int>().get(mem);
+ 
+-    tls_array[TLS_PROCESS_ID] = 1; // stubbed. unused
+     tls_array[TLS_THREAD_ID] = id;
+     tls_array[TLS_SP_TOP] = stack.get();
+     tls_array[TLS_SP_BOTTOM] = stack.get() + stack_size;
+@@ -103,6 +104,7 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+ 
+     CPUContext ctx;
+     ctx.set_sp(stack_top());
++    ctx.fpscr = INITIAL_FPSCR;
+     if (option) {
+         ctx.cpu_registers[0] = option->attr;
+         ctx.cpu_registers[1] = option->size;
+@@ -120,6 +122,8 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
+     run_start_callback = run_entry_callback;
+     returned_value = SCE_KERNEL_ERROR_NOT_DORMANT;
+     load_context(*cpu, init_cpu_ctx);
++    // A thread starts with TPIDRURW at 0, also when it starts again
++    write_tpidrurw(*cpu, 0);
+     write_pc(*cpu, entry_point);
+     write_lr(*cpu, kernel.halt_instruction_pc);
+     write_reg(*cpu, 0, arglen);
+@@ -217,6 +221,17 @@ void ThreadState::run_loop() {
+         lock.lock();
+     };
+ 
++    // The callbacks the thread created end with it, with their pending notifications
++    auto delete_callbacks = [&]() {
++        lock.unlock();
++        for (const auto &weak_cb : callbacks) {
++            if (const CallbackPtr cb = weak_cb.lock())
++                kernel.delete_callback(cb->uid);
++        }
++        callbacks.clear();
++        lock.lock();
++    };
++
+     while (true) {
+         // Check if this call-level is done (normal exit, guest return, or delete).
+         if (exit_requested || guest_returned || delete_requested) {
+@@ -227,6 +242,7 @@ void ThreadState::run_loop() {
+             if (top_level && status != ThreadStatus::dormant) {
+                 run_thread_end_callback();
+                 release_mutexes();
++                delete_callbacks();
+                 update_status(ThreadStatus::dormant);
+             }
+             // Return from nested levels to the top level (or completely if deleted)
+@@ -317,7 +333,7 @@ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
+     write_sp(*cpu, sp);
+ }
+ 
+-uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args) {
++uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args, bool fresh_vfp_state) {
+     std::unique_lock<std::mutex> thread_lock(mutex);
+     if (call_level == 0) {
+         LOG_ERROR("run_callback should not be called as the first thread entry");
+@@ -327,7 +343,15 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+     // save the current context before overwriting PC/LR for the callback
+     const CPUContext previous_ctx = save_context(*cpu);
+     const uint32_t previous_tpidruro = read_tpidruro(*cpu);
++    // A callback sees the thread's TPIDRURW, and the thread gets its own value back after it
++    const uint32_t previous_tpidrurw = read_tpidrurw(*cpu);
+     const uint32_t previous_returned_value = returned_value;
++    int &vfp_exception = tls.get_ptr<int>().get(mem)[TLS_VFP_EXCEPTION];
++    const int previous_vfp_exception = vfp_exception;
++    if (fresh_vfp_state) {
++        write_fpscr(*cpu, INITIAL_FPSCR);
++        vfp_exception = 0;
++    }
+ 
+     // we shouldn't have to clean the context I believe
+     write_pc(*cpu, callback_address);
+@@ -347,6 +371,9 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+     // but do it just in case
+     load_context(*cpu, previous_ctx);
+     write_tpidruro(*cpu, previous_tpidruro);
++    write_tpidrurw(*cpu, previous_tpidrurw);
++    if (fresh_vfp_state)
++        vfp_exception = previous_vfp_exception;
+ 
+     // The callback's result isn't the thread's exit status, unless the callback ended the thread
+     const uint32_t result = returned_value;
+@@ -436,17 +463,23 @@ WaitResult ThreadState::delay_until(Deadline deadline, bool callbacks) {
+     }
+ }
+ 
+-WaitResult ThreadState::wait_for_signal(bool callbacks) {
+-    while (true) {
+-        {
+-            const std::lock_guard<std::mutex> lock(mutex);
+-            if (std::exchange(signal_pending, false))
+-                return SCE_KERNEL_OK;
+-        }
+-        const WaitResult r = wait({ SCE_KERNEL_WAITTYPE_SIGNAL }, Deadline::max(), callbacks);
+-        if (!r)
+-            return r;
++WaitResult ThreadState::wait_for_signal(SceUInt32 *timeout, bool callbacks) {
++    const auto take_signal = [this] {
++        const std::lock_guard<std::mutex> lock(mutex);
++        return std::exchange(signal_pending, false);
++    };
++    // A signal sent before ends the wait at once, with the timeout untouched
++    if (take_signal())
++        return SCE_KERNEL_OK;
++    const Deadline deadline = deadline_from(timeout);
++    WaitResult r = SCE_KERNEL_OK;
++    while (!take_signal()) {
++        r = wait({ SCE_KERNEL_WAITTYPE_SIGNAL }, deadline, callbacks);
++        if (!r || *r != SCE_KERNEL_OK)
++            break;
+     }
++    writeback_timeout(timeout, deadline);
++    return r;
+ }
+ 
+ SceInt32 ThreadState::send_signal() {
+@@ -476,7 +509,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+     std::unique_lock<std::mutex> lock(mutex);
+     // Callbacks don't nest, so inside a callback this is a plain wait
+     const bool runs_callbacks = callbacks && !is_processing_callbacks;
+-    const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_pending); };
++    const auto woken = [&] { return exiting() || wake_pending || (runs_callbacks && callbacks_notified()); };
+     wait_target = { callbacks ? target.type | WAITTYPE_CB_BIT : target.type, target.id };
+     update_status(ThreadStatus::waiting);
+     bool satisfied = true;
+@@ -489,7 +522,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+     if (exiting())
+         return std::unexpected{ ThreadExiting{} };
+     wake_pending = false;
+-    if (runs_callbacks && callbacks_pending) {
++    if (runs_callbacks && callbacks_notified()) {
+         lock.unlock();
+         process_callbacks();
+         lock.lock();
+@@ -512,10 +545,6 @@ SceUInt32 ThreadState::process_callbacks() {
+     if (is_processing_callbacks)
+         return 0;
+ 
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        callbacks_pending = false;
+-    }
+     is_processing_callbacks = true;
+     SceUInt32 processed = 0;
+     for (auto it = callbacks.begin(); it != callbacks.end();) {
+@@ -529,17 +558,16 @@ SceUInt32 ThreadState::process_callbacks() {
+         const std::optional<Callback::Notification> notification = cb->take_notification();
+         if (!notification)
+             continue;
++        // A callback starts with the VFP state of a new thread, and the thread gets its own back after it
+         const uint32_t ret = run_callback(cb->cb_func.address(),
+-            { static_cast<uint32_t>(notification->notifier_id), notification->count, static_cast<uint32_t>(notification->arg), cb->userdata.address() });
++            { static_cast<uint32_t>(notification->notifier_id), notification->count, static_cast<uint32_t>(notification->arg), cb->userdata.address() }, true);
+         ++processed;
+         // A callback that exits the thread also ends the wait it runs in
+         {
+             const std::lock_guard<std::mutex> lock(mutex);
+-            if (exiting()) {
+-                // The callbacks after this one keep their notifications for when the thread runs again
+-                callbacks_pending = true;
++            // The thread's other callbacks are deleted when it ends, with their notifications
++            if (exiting())
+                 break;
+-            }
+         }
+         // A callback that returns nonzero deletes itself
+         if (ret != 0)
+@@ -549,12 +577,18 @@ SceUInt32 ThreadState::process_callbacks() {
+     return processed;
+ }
+ 
+-void ThreadState::notify_callbacks() {
++void ThreadState::add_notified_callback() {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    callbacks_pending = true;
++    ++notified_callbacks;
+     wait_cv.notify_all();
+ }
+ 
++void ThreadState::remove_notified_callback() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    if (notified_callbacks > 0)
++        --notified_callbacks;
++}
++
+ void ThreadState::add_callback(const CallbackPtr &cb) {
+     callbacks.push_back(cb);
+ }
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 01f78c7e..f337cfae 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -555,7 +555,7 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+         infoCpu->sb = 100000; // Todo
+         infoCpu->st = 100000; // Todo
+         infoCpu->teehbr = 100000; // Todo
+-        infoCpu->tpidrurw = read_tpidruro(*thread->cpu);
++        infoCpu->tpidrurw = read_tpidrurw(*thread->cpu);
+     }
+ 
+     SceKernelThreadVfpRegisterInfo *infoVfp = pVfpRegisterInfo.get(emuenv.mem);
+@@ -623,6 +623,7 @@ EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadIn
+     const std::lock_guard<std::mutex> lock(thread->mutex);
+     SceKernelThreadInfo full{};
+     strncpy(full.name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
++    full.attr = thread->attr;
+     full.stack = Ptr<void>(thread->stack.get());
+     full.stackSize = thread->stack_size;
+     full.initPriority = thread->priority; // Todo Give only current priority
+@@ -634,6 +635,7 @@ EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadIn
+     full.waitType = thread->wait_target.type;
+     full.waitId = thread->wait_target.id;
+     full.exitStatus = thread->returned_value;
++    full.fNotifyCallback = thread->callbacks_notified() ? 1 : 0;
+     write_info(info, full);
+     return SCE_KERNEL_OK;
+ }
+@@ -992,19 +994,16 @@ EXPORT(SceInt32, _sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUIn
+     return semaphore->wait(emuenv.kernel.get_thread(thread_id), needCount, pTimeout, true);
+ }
+ 
+-EXPORT(int, _sceKernelWaitSignal, uint32_t unknown, uint32_t delay, uint32_t timeout) {
++EXPORT(int, _sceKernelWaitSignal, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
+     TRACY_FUNC(_sceKernelWaitSignal, unknown, delay, timeout);
+-    STUBBED("sceKernelWaitSignal");
+-    const auto thread = emuenv.kernel.get_thread(thread_id);
+-    return guest_result(thread->wait_for_signal(false));
++    return guest_result(emuenv.kernel.get_thread(thread_id)->wait_for_signal(timeout, false));
+ }
+ 
+-EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, uint32_t timeout) {
++EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
+     TRACY_FUNC(_sceKernelWaitSignalCB, unknown, delay, timeout);
+-    STUBBED("sceKernelWaitSignalCB");
+-    const auto thread = emuenv.kernel.get_thread(thread_id);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+     thread->process_callbacks();
+-    return guest_result(thread->wait_for_signal(true));
++    return guest_result(thread->wait_for_signal(timeout, true));
+ }
+ 
+ // Waits for target to end, writing the time left back to timeout
+@@ -1208,6 +1207,9 @@ static bool is_user_priority(int priority) {
+         || (priority >= SCE_KERNEL_HIGHEST_DEFAULT_PRIORITY && priority <= SCE_KERNEL_LOWEST_DEFAULT_PRIORITY);
+ }
+ 
++// The attributes sceKernelCreateThread takes
++constexpr SceUInt32 THREAD_CREATE_ATTRS = THREAD_ATTR_UNKNOWN_2000 | THREAD_ATTR_NOUSE_VFP | THREAD_ATTR_VM | THREAD_ATTR_USER;
++
+ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry entry, int init_priority, SceKernelCreateThread_opt *options) {
+     TRACY_FUNC(sceKernelCreateThreadForUser, name, entry, init_priority, options);
+     if (!name)
+@@ -1220,6 +1222,8 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE);
+     if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
++    if (options->attr & ~THREAD_CREATE_ATTRS)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
+     // The new thread starts at the creating thread's current priority
+     if (init_priority == SCE_KERNEL_CURRENT_THREAD_PRIORITY)
+         init_priority = emuenv.kernel.get_thread(thread_id)->priority;
+@@ -1227,6 +1231,7 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
+     const ThreadStatePtr thread = emuenv.kernel.create_thread(emuenv.mem, name, entry.cast<void>(), init_priority, options->cpu_affinity_mask, options->stack_size, options->option.get(emuenv.mem));
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_ERROR);
++    thread->attr = options->attr | THREAD_ATTR_USER;
+     return thread->id;
+ }
+ 
+@@ -1588,8 +1593,11 @@ EXPORT(int, sceKernelResumeThreadForVM, SceUID threadId) {
+ 
+ EXPORT(int, sceKernelSendSignal, SceUID target_thread_id) {
+     TRACY_FUNC(sceKernelSendSignal, target_thread_id);
+-    STUBBED("sceKernelSendSignal");
+-    const auto thread = emuenv.kernel.get_thread(target_thread_id);
++    if (target_thread_id == 0)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(target_thread_id);
++    if (!thread)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+     return thread->send_signal();
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+index dd371e66..f34357c2 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+@@ -82,8 +82,8 @@ DECL_EXPORT(SceInt32, _sceKernelCancelTimer, SceUID timerId, SceUInt32 *pNumWait
+ DECL_EXPORT(int, _sceKernelRegisterThreadEventHandler, const char *name, SceUID thread_mask, SceUInt32 mask, sceKernelRegisterThreadEventHandlerOpt *opt);
+ DECL_EXPORT(int, _sceKernelWaitThreadEnd, SceUID thid, int *stat, SceUInt *timeout);
+ DECL_EXPORT(int, _sceKernelWaitThreadEndCB, SceUID thid, int *stat, SceUInt *timeout);
+-DECL_EXPORT(int, _sceKernelWaitSignal, uint32_t unknown, uint32_t delay, uint32_t timeout);
+-DECL_EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, uint32_t timeout);
++DECL_EXPORT(int, _sceKernelWaitSignal, uint32_t unknown, uint32_t delay, SceUInt32 *timeout);
++DECL_EXPORT(int, _sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, SceUInt32 *timeout);
+ DECL_EXPORT(int, _sceKernelSetThreadContextForVM, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo, Ptr<SceKernelThreadVfpRegisterInfo> pVfpRegisterInfo);
+ DECL_EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThreadCpuRegisterInfo> pCpuRegisterInfo, Ptr<SceKernelThreadVfpRegisterInfo> pVfpRegisterInfo);
+ DECL_EXPORT(int, sceKernelResumeThreadForVM, SceUID threadId);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index f20dfd9b..d9f5a0b2 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1156,9 +1156,13 @@ EXPORT(SceInt32, sceKernelCancelTimer, SceUID timerId, SceUInt32 *pNumWaitThread
+     return CALL_EXPORT(_sceKernelCancelTimer, timerId, pNumWaitThreads);
+ }
+ 
+-EXPORT(int, sceKernelChangeCurrentThreadAttr) {
+-    TRACY_FUNC(sceKernelChangeCurrentThreadAttr);
+-    return UNIMPLEMENTED();
++EXPORT(int, sceKernelChangeCurrentThreadAttr, SceUInt clear_attr, SceUInt set_attr) {
++    TRACY_FUNC(sceKernelChangeCurrentThreadAttr, clear_attr, set_attr);
++    // A Vita takes only these, and thread info doesn't show a change to either
++    constexpr SceUInt32 CHANGEABLE_ATTRS = THREAD_ATTR_NOUSE_VFP | THREAD_ATTR_USER;
++    if ((clear_attr | set_attr) & ~CHANGEABLE_ATTRS)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ATTR);
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, sceKernelCheckThreadStack) {
+@@ -1919,12 +1923,12 @@ EXPORT(SceInt32, sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUInt
+     return CALL_EXPORT(_sceKernelWaitSemaCB, semaId, needCount, pTimeout);
+ }
+ 
+-EXPORT(int, sceKernelWaitSignal, uint32_t unknown, uint32_t delay, uint32_t timeout) {
++EXPORT(int, sceKernelWaitSignal, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
+     TRACY_FUNC(sceKernelWaitSignal, unknown, delay, timeout);
+     return CALL_EXPORT(_sceKernelWaitSignal, unknown, delay, timeout);
+ }
+ 
+-EXPORT(int, sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, uint32_t timeout) {
++EXPORT(int, sceKernelWaitSignalCB, uint32_t unknown, uint32_t delay, SceUInt32 *timeout) {
+     TRACY_FUNC(sceKernelWaitSignalCB, unknown, delay, timeout);
+     return CALL_EXPORT(_sceKernelWaitSignalCB, unknown, delay, timeout);
+ }
+-- 
+2.54.0.windows.1
+

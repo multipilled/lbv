@@ -1,0 +1,145 @@
+From aea372779370315c13d3c2582f3fe60f9947e885 Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:36:34 -0400
+Subject: [PATCH 60/60] Surface cache: a surface the guest wrote, or a new
+ atlas-sized one, starts from its guest memory (Vita3K-Plus 6cd1cb84a)
+
+---
+ .../include/renderer/vulkan/surface_cache.h   |  4 ++
+ vita3k/renderer/src/vulkan/surface_cache.cpp  | 62 ++++++++++++++++++-
+ 2 files changed, 65 insertions(+), 1 deletion(-)
+
+diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+index 26c0476f8..651a6ca76 100644
+--- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
++++ b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+@@ -104,6 +104,8 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
+ 
+     // only used for 3-component rgb textures which can't be copied directly
+     std::unique_ptr<vkutil::Buffer> copy_buffer;
++    // staging buffer that loads the surface's guest memory into its image (try_upload_guest_content)
++    std::unique_ptr<vkutil::Buffer> upload_buffer;
+     // surface sync's copy for the CPU, in cached system memory (vkutil::vma_readback_alloc)
+     std::unique_ptr<vkutil::Buffer> readback_buffer;
+ 
+@@ -207,6 +209,8 @@ private:
+     void destroy_framebuffers(vk::ImageView view);
+ 
+     void destroy_surface(ColorSurfaceCacheInfo &info);
++    // load a surface's guest memory into its Vulkan image (recorded in prerender_cmd); false if not supported
++    bool try_upload_guest_content(ColorSurfaceCacheInfo &info, MemState &mem);
+     void destroy_surface(DepthStencilSurfaceCacheInfo &info);
+ 
+     // record and submit a one-off command list copying the surface into the mapped buffer at its
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 7f5ec0441..5bc1e2b7e 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -18,6 +18,7 @@
+ #include <renderer/vulkan/surface_cache.h>
+ 
+ #include <gxm/functions.h>
++#include <mem/functions.h>
+ #include <renderer/vulkan/gxm_to_vulkan.h>
+ #include <renderer/vulkan/state.h>
+ #include <renderer/vulkan/types.h>
+@@ -152,6 +153,10 @@ void VKSurfaceCache::destroy_surface(ColorSurfaceCacheInfo &info) {
+         destroy_queue.add(info.white_view);
+         info.white_view = nullptr;
+     }
++    if (info.upload_buffer) {
++        destroy_queue.add_buffer(*info.upload_buffer);
++        info.upload_buffer.reset();
++    }
+ 
+     destroy_framebuffers(info.texture.view);
+     destroy_queue.add_image(info.texture);
+@@ -211,6 +216,8 @@ void VKSurfaceCache::cleanup() {
+             info.blit_image->destroy();
+         if (info.copy_buffer)
+             info.copy_buffer->destroy();
++        if (info.upload_buffer)
++            info.upload_buffer->destroy();
+ 
+         info.texture.destroy();
+     }
+@@ -243,6 +250,50 @@ void VKSurfaceCache::cleanup() {
+     last_written_surface = nullptr;
+ }
+ 
++// On the hardware a surface is its memory: a game may write it with the CPU (or the transfer unit) and render into
++// it. Loads the guest memory into the surface's image, before the scene's draws (Vita3K-Plus 6cd1cb84a).
++bool VKSurfaceCache::try_upload_guest_content(ColorSurfaceCacheInfo &info, MemState &mem) {
++    const bool supported = state.features.enable_memory_mapping
++        && state.res_multiplier == 1.0f
++        && info.tiling == SurfaceTiling::Linear
++        && format_support_surface_sync(info.format)
++        && info.swizzle.r == vk::ComponentSwizzle::eR
++        && vk::blockSize(info.texture.format) > 0
++        && (info.stride_bytes % vk::blockSize(info.texture.format)) == 0;
++    if (!supported)
++        return false;
++    const vk::DeviceSize upload_size = static_cast<vk::DeviceSize>(info.stride_bytes) * info.original_height;
++    // a surface's descriptor can cover more than its allocation
++    if (!is_valid_addr_range(mem, info.data.address(), info.data.address() + static_cast<uint32_t>(upload_size)))
++        return false;
++
++    if (info.upload_buffer && info.upload_buffer->size < upload_size) {
++        state.frame().destroy_queue.add_buffer(*info.upload_buffer);
++        info.upload_buffer.reset();
++    }
++    if (!info.upload_buffer)
++        info.upload_buffer = std::make_unique<vkutil::Buffer>();
++    if (!info.upload_buffer->buffer) {
++        info.upload_buffer->size = upload_size;
++        info.upload_buffer->init_buffer(vk::BufferUsageFlagBits::eTransferSrc, vkutil::vma_mapped_alloc);
++    }
++    memcpy(info.upload_buffer->mapped_data, info.data.get(mem), upload_size);
++
++    const vk::CommandBuffer cmd = reinterpret_cast<VKContext *>(state.context)->prerender_cmd;
++    const vk::BufferImageCopy copy{
++        .bufferOffset = 0,
++        .bufferRowLength = static_cast<uint32_t>(info.stride_bytes / vk::blockSize(info.texture.format)),
++        .bufferImageHeight = info.original_height,
++        .imageSubresource = vkutil::color_subresource_layer,
++        .imageOffset = { 0, 0, 0 },
++        .imageExtent = { info.original_width, info.original_height, 1 }
++    };
++    info.texture.transition_to(cmd, vkutil::ImageLayout::TransferDst);
++    cmd.copyBufferToImage(info.upload_buffer->buffer, info.texture.image, vk::ImageLayout::eTransferDstOptimal, copy);
++    info.texture.transition_to(cmd, vkutil::ImageLayout::ColorAttachmentReadWrite);
++    return true;
++}
++
+ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(MemState &mem, SceGxmColorSurface *color) {
+     // shader interlock loads and stores the surface as a storage image and does the sRGB conversions itself, so an sRGB
+     // surface gets a linear view for it (Killzone Mercenary's character shadows: an sRGB view decoded each load a second
+@@ -346,8 +397,11 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+             }
+             color_surface_queue.set_as_mru(&info);
+ 
+-            if (info.data && *info.dirty)
++            if (info.data && *info.dirty) {
++                // the guest wrote the surface's memory since it was last rendered: render over that
++                try_upload_guest_content(info, mem);
+                 protect_surface(mem, info);
++            }
+             *info.dirty = false;
+ 
+             last_written_surface = &info;
+@@ -445,6 +499,12 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+     cmd_buffer.clearColorImage(image.image, vk::ImageLayout::eTransferDstOptimal, clear_color, vkutil::color_subresource_range);
+     image.transition_to(cmd_buffer, vkutil::ImageLayout::ColorAttachmentReadWrite);
+ 
++    // an atlas-sized new surface starts with what the game already put in its memory, not black (LBP's 2048x2048
++    // atlas: tiles streamed in by the CPU, then drawn into; cleared, its untouched blocks were opaque black and an
++    // alpha-tested mesh painted the tutorial black). Smaller targets keep the clear (Vita3K-Plus 6cd1cb84a)
++    if (info_added.data && original_width >= 1024 && original_height >= 1024)
++        try_upload_guest_content(info_added, mem);
++
+     last_written_surface = &info_added;
+     info_added.need_surface_sync.reset();
+     info_added.need_surface_sync = std::make_shared<bool>(false);
+-- 
+2.54.0.windows.1
+

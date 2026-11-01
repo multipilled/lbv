@@ -1,0 +1,90 @@
+From 94a3bf17502ecd63d9b9fb680c2dfdaf6307385d Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 21:20:18 -0400
+Subject: [PATCH] lbv: kernel: NativeCPU follows upstream's thread-ending rework and
+ TPIDRURW (fork adaptation)
+
+Upstream cf12e2b0/f0273e4c/c82b97f7 replaced exit_requested/delete_requested with request_ending(). The fork's
+aot_unwind hooks go on exit_delete() and request_removal() too, and the top level clears it before the end
+handler runs (as before). Upstream's CPUInterface gained get/set_tpidrurw (thread.cpp saves it around
+callbacks); NativeCPU keeps it as a member: recompiled code never touches TPIDRURW (the kit translates only
+TPIDRURO), so the DLL ABI is unchanged.
+---
+ vita3k/cpu/include/cpu/impl/native_cpu.h | 4 ++++
+ vita3k/cpu/src/native_cpu.cpp            | 8 ++++++++
+ vita3k/kernel/src/thread.cpp             | 4 ++++
+ 3 files changed, 16 insertions(+)
+
+diff --git a/vita3k/cpu/include/cpu/impl/native_cpu.h b/vita3k/cpu/include/cpu/impl/native_cpu.h
+index e31a53c6..aadaa270 100644
+--- a/vita3k/cpu/include/cpu/impl/native_cpu.h
++++ b/vita3k/cpu/include/cpu/impl/native_cpu.h
+@@ -27,6 +27,7 @@
+ 
+ class NativeCPU : public CPUInterface, public AotOwner {
+     CPUState *parent;
++    uint32_t tpidrurw = 0;
+     std::size_t core_id;
+     armrecomp::GuestContext guest{};
+     uint32_t cpsr_rest = 0x10; // mode and the T bit; the flags live in the native context
+@@ -54,6 +55,9 @@ public:
+     void set_cpsr(uint32_t val) override;
+     uint32_t get_tpidruro() override;
+     void set_tpidruro(uint32_t val) override;
++    // recompiled code never reads or writes TPIDRURW (c13, c0, 2): only the kernel does, so it stays out of the ABI
++    uint32_t get_tpidrurw() override;
++    void set_tpidrurw(uint32_t val) override;
+     float get_float_reg(uint8_t idx) override;
+     void set_float_reg(uint8_t idx, float val) override;
+     uint32_t get_fpscr() override;
+diff --git a/vita3k/cpu/src/native_cpu.cpp b/vita3k/cpu/src/native_cpu.cpp
+index 975b84cf..b83b7465 100644
+--- a/vita3k/cpu/src/native_cpu.cpp
++++ b/vita3k/cpu/src/native_cpu.cpp
+@@ -208,6 +208,14 @@ void NativeCPU::set_tpidruro(uint32_t val) {
+     guest.tpidruro = val;
+ }
+ 
++uint32_t NativeCPU::get_tpidrurw() {
++    return tpidrurw;
++}
++
++void NativeCPU::set_tpidrurw(uint32_t val) {
++    tpidrurw = val;
++}
++
+ float NativeCPU::get_float_reg(uint8_t idx) {
+     return guest.vfp.f[idx];
+ }
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index d7965e60..f6706ac5 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -163,6 +163,7 @@ void ThreadState::exit_delete(SceInt32 status) {
+     std::lock_guard<std::mutex> lock(mutex);
+     request_ending(Ending::exit_delete);
+     returned_value = static_cast<uint32_t>(status);
++    cpu->aot_unwind = true;
+ }
+ 
+ void ThreadState::remove() {
+@@ -180,6 +181,7 @@ SceInt32 ThreadState::remove_dormant() {
+ 
+ void ThreadState::request_removal() {
+     request_ending(Ending::remove);
++    cpu->aot_unwind = true;
+     // A dormant thread is gone at once
+     if (status == ThreadStatus::dormant)
+         update_status(ThreadStatus::deleted);
+@@ -258,6 +260,8 @@ void ThreadState::run_loop(bool top_level) {
+             // A nested level returns to the one below it
+             if (!top_level)
+                 break;
++            // native frames are gone once the top level sees the ending
++            cpu->aot_unwind = false;
+             // A thread that returns from its entry ends like one that exits, end handler included
+             if (guest_returned)
+                 request_ending(Ending::exit);
+-- 
+2.54.0.windows.1
+

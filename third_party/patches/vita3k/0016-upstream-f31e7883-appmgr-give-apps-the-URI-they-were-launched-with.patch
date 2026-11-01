@@ -1,0 +1,204 @@
+From 7ff0a2d03012877dd96577425ee9e783a3ebc882 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Sun, 11 Oct 2026 11:15:19 +0900
+Subject: [PATCH 16/52] appmgr: give apps the URI they were launched with
+
+- --launch-uri sets the URI sceAppMgrGetAppParam gives the app, as if
+  another app had launched it with it. Without it the app gets an empty
+  string, like after a LiveArea launch.
+- Like a Vita, only the first call gets the URI. Later calls get an
+  empty string and 0x80802015, and a URI of 1024 bytes or more comes
+  back cut to 1024 bytes with no terminator.
+
+(cherry picked from commit f31e78833252faf8ab929967f2f0f05ee68fb48f)
+---
+ vita3k/app/src/app.cpp                        |  1 +
+ vita3k/app/src/app_init.cpp                   |  1 +
+ vita3k/config/include/config/state.h          |  1 +
+ vita3k/config/src/config.cpp                  |  3 +++
+ vita3k/emuenv/include/emuenv/state.h          | 19 +++++++++++++++++++
+ vita3k/interface.cpp                          |  3 +++
+ vita3k/modules/SceAppMgr/SceAppMgr.cpp        | 19 ++++++++++++++++---
+ vita3k/modules/SceAppMgr/SceAppMgr.h          |  2 ++
+ .../modules/SceDriverUser/SceAppMgrUser.cpp   |  6 +++---
+ 9 files changed, 49 insertions(+), 6 deletions(-)
+
+diff --git a/vita3k/app/src/app.cpp b/vita3k/app/src/app.cpp
+index afbb4cbf..0c08af26 100644
+--- a/vita3k/app/src/app.cpp
++++ b/vita3k/app/src/app.cpp
+@@ -356,6 +356,7 @@ void abort_game_launch(EmuEnvState &emuenv) {
+     emuenv.license_title_id.clear();
+     emuenv.self_name.clear();
+     emuenv.self_path.clear();
++    emuenv.clear_launch_uri();
+     emuenv.main_thread_id = 0;
+     emuenv.app_info = {};
+     emuenv.drop_inputs = false;
+diff --git a/vita3k/app/src/app_init.cpp b/vita3k/app/src/app_init.cpp
+index 3f092cef..20e2df45 100644
+--- a/vita3k/app/src/app_init.cpp
++++ b/vita3k/app/src/app_init.cpp
+@@ -535,6 +535,7 @@ void reset_app_state(EmuEnvState &state) {
+     state.current_app_title.clear();
+     state.self_name.clear();
+     state.self_path.clear();
++    state.clear_launch_uri();
+     state.main_thread_id = 0;
+     state.drop_inputs = false;
+     state.missing_nids.clear();
+diff --git a/vita3k/config/include/config/state.h b/vita3k/config/include/config/state.h
+index 7e377b56..995ef261 100644
+--- a/vita3k/config/include/config/state.h
++++ b/vita3k/config/include/config/state.h
+@@ -46,6 +46,7 @@ struct Config {
+     // Setting not present in the YAML file
+     fs::path config_path = {};
+     std::string app_args;
++    std::string launch_uri;
+     std::string self_path;
+     bool overwrite_config = true;
+     bool load_config = false;
+diff --git a/vita3k/config/src/config.cpp b/vita3k/config/src/config.cpp
+index 46250259..4c2f365c 100644
+--- a/vita3k/config/src/config.cpp
++++ b/vita3k/config/src/config.cpp
+@@ -174,6 +174,7 @@ static void check_members(Config &self, const Config &rhs) {
+     self.zero_init_registers = rhs.zero_init_registers;
+     self.depth_store_scenes = rhs.depth_store_scenes;
+     self.app_args = rhs.app_args;
++    self.launch_uri = rhs.launch_uri;
+     self.load_app_list = rhs.load_app_list;
+     self.self_path = rhs.self_path;
+ }
+@@ -359,6 +360,8 @@ ExitCode init_config(Config &cfg, int argc, char **argv, const Root &root_paths,
+        ->default_val(false)->group("Input");
+     input->add_option("--app-args,-Z", command_line.app_args, "Argument for app, use ', ' to separate arguments.")
+         ->default_str("")->group("Input");
++    input->add_option("--launch-uri", command_line.launch_uri, "URI the app gets from sceAppMgrGetAppParam, as if another app launched it with it, like psgm:play?titleid=PCSA00000&arg=1")
++        ->default_str("")->group("Input");
+     input->add_option("--load-app-list,-a", command_line.load_app_list, "Starts the emulator with load app list.")
+        ->default_val(false)->group("Input");
+     const std::map<std::string, Frontend> frontends{ { "qt", Frontend::qt }, { "sdl", Frontend::sdl } };
+diff --git a/vita3k/emuenv/include/emuenv/state.h b/vita3k/emuenv/include/emuenv/state.h
+index 6e5ff7f2..1a04163d 100644
+--- a/vita3k/emuenv/include/emuenv/state.h
++++ b/vita3k/emuenv/include/emuenv/state.h
+@@ -116,6 +116,9 @@ private:
+     std::unique_ptr<CompatState> _compat;
+     mutable std::mutex _launch_request_mutex;
+     std::optional<AppLaunchRequest> _pending_launch_request;
++    // The URI the running app was launched with, until sceAppMgrGetAppParam takes it
++    mutable std::mutex _launch_uri_mutex;
++    std::optional<std::string> _launch_uri;
+ 
+ public:
+     // App info contained in its `param.sfo` file
+@@ -200,6 +203,22 @@ public:
+         _pending_launch_request.reset();
+     }
+ 
++    void set_launch_uri(std::string uri) {
++        std::scoped_lock lock(_launch_uri_mutex);
++        _launch_uri = std::move(uri);
++    }
++
++    // Returns the launch URI to the first caller only
++    std::optional<std::string> take_launch_uri() {
++        std::scoped_lock lock(_launch_uri_mutex);
++        return std::exchange(_launch_uri, std::nullopt);
++    }
++
++    void clear_launch_uri() {
++        std::scoped_lock lock(_launch_uri_mutex);
++        _launch_uri.reset();
++    }
++
+     Root get_root_paths() const {
+         Root r;
+         r.set_vita_fs_path(vita_fs_path);
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index c89788cb..b493ae40 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -729,6 +729,9 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
+     }
+     emuenv.main_thread_id = main_thread->id;
+ 
++    // Before any guest code runs, module_start functions included, since they can read it too
++    emuenv.set_launch_uri(emuenv.cfg.launch_uri);
++
+     // Run `module_start` export (entry point) of loaded libraries
+     for (auto &[_, module] : emuenv.kernel.loaded_modules) {
+         if (module->info.modid != main_module_id)
+diff --git a/vita3k/modules/SceAppMgr/SceAppMgr.cpp b/vita3k/modules/SceAppMgr/SceAppMgr.cpp
+index 11770756..515edbf3 100644
+--- a/vita3k/modules/SceAppMgr/SceAppMgr.cpp
++++ b/vita3k/modules/SceAppMgr/SceAppMgr.cpp
+@@ -189,9 +189,22 @@ EXPORT(int, _sceAppMgrGetAppMgrState) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _sceAppMgrGetAppParam) {
+-    TRACY_FUNC(_sceAppMgrGetAppParam);
+-    return UNIMPLEMENTED();
++// The size sceAppMgrGetAppParam writes at most, without a terminator if the URI fills it
++constexpr size_t APP_PARAM_SIZE = 1024;
++
++EXPORT(SceInt32, _sceAppMgrGetAppParam, char *param) {
++    TRACY_FUNC(_sceAppMgrGetAppParam, param);
++    if (!param)
++        return RET_ERROR(SCE_APPMGR_ERROR_NULL_POINTER);
++
++    // Only the first call gets the launch URI, the ones after it get an empty string
++    const std::optional<std::string> uri = emuenv.take_launch_uri();
++    if (!uri) {
++        param[0] = '\0';
++        return SCE_APPMGR_ERROR_APP_PARAM_READ;
++    }
++    memcpy(param, uri->c_str(), std::min(uri->size() + 1, APP_PARAM_SIZE));
++    return 0;
+ }
+ 
+ EXPORT(int, _sceAppMgrGetAppParam2) {
+diff --git a/vita3k/modules/SceAppMgr/SceAppMgr.h b/vita3k/modules/SceAppMgr/SceAppMgr.h
+index 9397f83d..ea2669fc 100644
+--- a/vita3k/modules/SceAppMgr/SceAppMgr.h
++++ b/vita3k/modules/SceAppMgr/SceAppMgr.h
+@@ -24,6 +24,7 @@ enum SceAppMgrErrorCode : uint32_t {
+     SCE_APPMGR_ERROR_INVALID_PARAMETER2 = 0x80801000, //!< Invalid parameter (wrong value)
+     SCE_APPMGR_ERROR_BUSY = 0x80802000, //!< Busy
+     SCE_APPMGR_ERROR_STATE = 0x80802013, //!< Invalid state
++    SCE_APPMGR_ERROR_APP_PARAM_READ = 0x80802015, //!< The app param was already read
+     SCE_APPMGR_ERROR_NULL_POINTER = 0x80802016, //!< NULL pointer
+     SCE_APPMGR_ERROR_INVALID = 0x8080201A, //!< Invalid param
+     SCE_APPMGR_ERROR_TOO_LONG_ARGV = 0x8080201D, //!< argv is too long
+@@ -63,6 +64,7 @@ typedef struct sceAppMgrAppParamGetStringOptParam {
+ 
+ DECL_EXPORT(SceInt32, __sceAppMgrGetAppState, SceAppMgrAppState *appState, SceUInt32 sizeofSceAppMgrAppState, SceUInt32 buildVersion);
+ DECL_EXPORT(SceInt32, _sceAppMgrAppParamGetString, int pid, int param, char *string, sceAppMgrAppParamGetStringOptParam *optParam);
++DECL_EXPORT(SceInt32, _sceAppMgrGetAppParam, char *param);
+ DECL_EXPORT(SceInt32, _sceAppMgrLoadExec, const char *appPath, Ptr<char> const argv[], const SceAppMgrLoadExecOptParam *optParam);
+ DECL_EXPORT(SceInt32, _sceAppMgrMmsMount, SceInt32 id, char *mount_point);
+ 
+diff --git a/vita3k/modules/SceDriverUser/SceAppMgrUser.cpp b/vita3k/modules/SceDriverUser/SceAppMgrUser.cpp
+index 1d098131..f7bd5cbc 100644
+--- a/vita3k/modules/SceDriverUser/SceAppMgrUser.cpp
++++ b/vita3k/modules/SceDriverUser/SceAppMgrUser.cpp
+@@ -216,9 +216,9 @@ EXPORT(int, sceAppMgrGetAppMgrState) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, sceAppMgrGetAppParam) {
+-    TRACY_FUNC(sceAppMgrGetAppParam);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceAppMgrGetAppParam, char *param) {
++    TRACY_FUNC(sceAppMgrGetAppParam, param);
++    return CALL_EXPORT(_sceAppMgrGetAppParam, param);
+ }
+ 
+ EXPORT(int, sceAppMgrGetAppParam2) {
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,30 @@
+From 8b24cb253697062dd30ba5410a1a0eca927dce80 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 8 Oct 2026 21:42:31 +0900
+Subject: [PATCH 14/52] kernel: clear a pending timer event when setting a new
+ one
+
+sceKernelSetTimerEvent drops an event the timer already reported but no thread took yet.
+
+(cherry picked from commit 54cbfd540505469fca9e53fdaf5b21130f4699e9)
+---
+ vita3k/kernel/src/sync_primitives.cpp | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 170b7f09..bc92e499 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -185,6 +185,8 @@ SceInt32 Timer::set_event(SceUID type, SceKernelSysClock interval, SceInt32 repe
+     is_pulse = type != 0;
+     is_repeat = repeats != 0;
+     event_interval = interval;
++    // A new timer event starts from not notified
++    event_set = false;
+ 
+     if (is_started)
+         schedule_event();
+-- 
+2.54.0.windows.1
+

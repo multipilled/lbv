@@ -1,0 +1,15 @@
+diff --git a/recomp/make_tests.py b/recomp/make_tests.py
+index 7b750cd..565ecdb 100644
+--- a/recomp/make_tests.py
++++ b/recomp/make_tests.py
+@@ -95,8 +95,8 @@ def main():
+                 continue
+             key = (bytes(ins.cs.bytes), ins.it_cond)
+             fm = form(ins)
+-            if ins.mnemonic == 'vmov' and '.' in ins.cs.mnemonic:
+-                fm += ' .' + ins.cs.mnemonic.split('.', 1)[1]  # lane moves by element size
++            if ins.mnemonic in ('vmov', 'vcvt') and '.' in ins.cs.mnemonic:
++                fm += ' .' + ins.cs.mnemonic.split('.', 1)[1]  # lane moves by element size, conversions by direction
+             slot = chosen[fm if f.thumb else 'arm:' + fm]
+             if key in slot or len(slot) >= per_form:
+                 continue

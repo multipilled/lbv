@@ -1,0 +1,1074 @@
+From 920c82b1db470dfaf470c495274eb9680e7ac9f3 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Tue, 13 Oct 2026 14:17:54 +0900
+Subject: [PATCH 20/52] kernel: fix more sync primitives behavior found on
+ hardware (#4228)
+
+* kernel: wake one waiter when signaling a condition
+
+Signaling a condition woke every waiting thread, like signaling all of
+them does. It now wakes only the first thread in the queue, as a Vita
+does.
+
+* kernel: release the mutexes of a thread that ends
+
+A thread that ended while holding a mutex kept it forever, and its
+waiters waited until they timed out. On a Vita the mutex is unlocked
+when its owner ends and goes to the next waiter, so do that.
+
+* kernel: write back the time left after a message pipe wait
+
+Message pipe sends and receives that waited never wrote the time left
+back to their timeout, so one that timed out still had all of it. They
+now write it back like the other waits.
+
+* kernel: keep a thread's exit status like a Vita does
+
+A thread's exit status is now DORMANT until it first starts,
+NOT_DORMANT while it runs, and then the value it returned or exited
+with. The thread info reports it for every thread, not just ended ones,
+a wait for the end of a thread that never started gets it at once, and
+getting the exit status of a thread that never started fails with
+DORMANT. A callback's result no longer replaces the exit status, and
+sceKernelGetThreadExitStatus calls the thread manager's version instead
+of keeping its own copy.
+
+* kernel: fix the errors for starting a running thread or deleting oneself
+
+Starting a thread that isn't dormant now fails with NOT_DORMANT instead
+of RUNNING, and a thread deleting itself fails with ILLEGAL_THREAD_ID
+instead of NOT_DORMANT, as on a Vita.
+
+* kernel: report CPU affinity masks as they were set
+
+A thread created with an affinity mask of 0 reported every user core,
+while on a Vita it reports 0, and so does changing its affinity. Getting
+the affinity now returns the mask as it was set. A main thread whose
+process doesn't give one gets every user core, which is what a Vita
+reports for it. sceKernelGetThreadCpuAffinityMask2 still reports every
+user core for a mask of 0.
+
+* kernel: implement sceKernelGetThreadStackFreeSize
+
+It was unimplemented. It now returns the whole stack for a dormant
+thread, and the space below the stack pointer for one that started, or
+fails with UNKNOWN_THREAD_ID for a UID that isn't a thread.
+
+* kernel: fix the errors for thread affinity and exit status arguments
+
+Creating a thread with an affinity mask that has cores games can't use
+now fails with ILLEGAL_CPU_AFFINITY_MASK instead of
+INVALID_CPU_AFFINITY, and getting an exit status into a NULL pointer
+fails with ILLEGAL_ADDR, as on a Vita.
+
+* kernel: copy as much of a thread's info as the game asks for
+
+sceKernelGetThreadInfo failed for any size but the struct's. Like the
+other info getters, it now copies the start of the struct, as many bytes
+as the size the game sets, and fails with NO_MEMORY for a size past the
+struct. The fields it doesn't fill in are now 0.
+
+* kernel: count timer time like a Vita does
+
+A timer kept only the clock time it was last started or stopped at, so
+a new timer wasn't at 0, a stopped one went on counting and setting the
+time didn't move the count. It now keeps a count that starts at 0,
+stops while the timer is stopped and goes on from there when it starts
+again, and setting the time replaces it. Stopping a timer returns 1
+when it stopped it and 0 when it was stopped already, the other way
+around before. The base is now the process time the count runs from,
+and sceKernelSetTimerTimeWide returns the whole 64-bit old time.
+
+* kernel: give a failed timer poll no bits
+
+A timer poll or wait that didn't get the event still got the timer bit
+as its result. It now gets 0, as on a Vita, and only a take that gets
+the event gets the timer bit.
+
+* kernel: let a waiting writer go first on a reader/writer lock
+
+Unlocking a reader/writer lock handed it to the waiters in queue order,
+so readers that waited before a writer went first, and new readers got
+in while a writer waited. Like on a Vita, an unlock now gives the lock
+to the first waiting writer, or to every waiting reader if no writer
+waits, and a read lock fails or waits while a writer waits.
+
+* kernel: order message pipe waiters by the pipe's own attributes
+
+Message pipes ordered their receivers by the thread priority attribute
+the other objects use, which creating a message pipe refuses, and their
+senders always in FIFO order. Receivers now queue by priority with
+attribute 0x2, as on a Vita, and senders with 0x1.
+
+* kernel: report an event flag's initial pattern in its info
+
+The event flag info gave the current pattern as the initial one too.
+It now gives the pattern the event flag was created with.
+
+* kernel: round message pipe buffers up to 4 KiB
+
+A message pipe got a buffer of exactly the size it was created with.
+On a Vita the buffer is rounded up to a multiple of 4 KiB, which its
+info reports, so a 256 byte pipe holds 4 KiB.
+
+* kernel: implement sceKernelGetMsgPipeInfo
+
+It was unimplemented. It now reports a message pipe's name, attributes,
+buffer and free sizes and how many threads wait to send or receive,
+like the other info getters.
+
+* kernel: report a callback's notification count in its info
+
+The callback info left the notification count at 0. It now gives how
+many times the callback was notified since it last ran.
+
+* kernel: fill lightweight mutex and condition work areas like a Vita
+
+Games can read these work areas, so they now hold what a Vita leaves in
+them. Creating a lightweight mutex or condition clears its work area
+first, and unlocking a lightweight mutex writes its new owner and count
+to it. A lightweight condition's work area holds its mutex's UID after
+its own, and both become 0xFFFFFFFF when it is deleted.
+sceKernelDeleteLwCond now calls the thread manager's version instead of
+keeping its own copy.
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the VitaAutotests commit that adds two tests, a
+thread that holds a read lock reading again while a writer waits, which
+passes, and changing the priority of a waiting thread, which still
+fails.
+
+(cherry picked from commit 20df7f4ea7e2e7659c8c1e25b3c47e3063b69b57)
+---
+ vita3k/interface.cpp                          |   3 +
+ vita3k/kernel/include/kernel/state.h          |   2 +
+ .../kernel/include/kernel/sync_primitives.h   |  28 ++--
+ .../include/kernel/thread/thread_state.h      |   4 +-
+ .../kernel/include/kernel/thread/wait_queue.h |   8 ++
+ vita3k/kernel/include/kernel/types.h          |  16 ++-
+ vita3k/kernel/src/kernel.cpp                  |   5 +
+ vita3k/kernel/src/sync_primitives.cpp         | 117 +++++++++++------
+ vita3k/kernel/src/thread.cpp                  |  22 +++-
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 122 +++++++++++-------
+ .../modules/SceKernelThreadMgr/SceThreadmgr.h |   3 +
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  |  39 ++----
+ 12 files changed, 240 insertions(+), 129 deletions(-)
+
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index b493ae40..25e0d7b2 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -722,6 +722,9 @@ ExitCode run_app(EmuEnvState &emuenv, int32_t main_module_id, const AppLaunchReq
+             affinity = *affinity_ptr.get(emuenv.mem);
+         }
+     }
++    // A main thread without its own affinity runs on every user core and reports them all
++    if (affinity == SCE_KERNEL_THREAD_CPU_AFFINITY_MASK_DEFAULT)
++        affinity = SCE_KERNEL_CPU_MASK_USER_ALL;
+     const ThreadStatePtr main_thread = emuenv.kernel.create_thread(emuenv.mem, emuenv.io.title_id.c_str(), entry_point, priority, affinity, stack_size, nullptr);
+     if (!main_thread) {
+         LOG_ERROR("Failed to init main thread.");
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 172a9ccd..31bef893 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -154,6 +154,8 @@ struct KernelState {
+ 
+     uint64_t start_tick;
+     SceRtcTick base_tick;
++    // Returns the process time at a time of the host clock that timers count with
++    uint64_t process_time_at(uint64_t clock_time) const;
+     Ptr<SceProcessParam> process_param;
+     Ptr<void> client_vtable = Ptr<void>(0);
+     Ptr<Address> shellsvc_client = Ptr<Address>(0);
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 5ba8f22b..220b4e39 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -84,8 +84,10 @@ public:
+     SceInt32 start();
+     SceInt32 stop();
+     SceInt32 cancel(SceUInt32 *num_wait_threads);
+-    // Replaces time and returns its old value, or the error.
++    // Replaces the count and returns its old value, or the error.
+     std::expected<uint64_t, SceInt32> set_time(uint64_t new_time);
++    // Returns how much time the timer counted. The lock must be held.
++    uint64_t count() const;
+ 
+     // Only the first waiter waits for the next event, the others wait for their turn
+     WaitQueue<std::monostate> waiters;
+@@ -94,7 +96,10 @@ public:
+     bool is_repeat = false;
+     bool is_pulse = false;
+     bool event_set = false;
+-    uint64_t time = 0;
++    // The clock time the count runs from while the timer is started, 0 if it never started
++    uint64_t base = 0;
++    // The count while the timer is stopped
++    uint64_t stopped_count = 0;
+     uint64_t next_event = std::numeric_limits<uint64_t>::max();
+     uint64_t event_interval = 0;
+ 
+@@ -147,8 +152,10 @@ public:
+     // Same as acquire, but reports the wait as target, for a condition variable taking its mutex back
+     SceInt32 acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 count, SceUInt32 *timeout, WaitTarget target, bool callbacks);
+     SceInt32 try_acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 count);
+-    SceInt32 release(const ThreadStatePtr &thread, SceInt32 unlock_count);
++    SceInt32 release(MemState &mem, const ThreadStatePtr &thread, SceInt32 unlock_count);
+     SceInt32 cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt32 *num_wait_threads);
++    // Unlocks the mutex of an owner that ended and gives it to the next waiter. The lock must be held.
++    void release_ended_owner();
+ 
+     struct WaitEntry {
+         SceInt32 lock_count;
+@@ -167,6 +174,8 @@ private:
+     SceInt32 check_count(SceInt32 count) const;
+     // Takes the mutex if it is free or owned by thread, or returns why it can't. The lock must be held.
+     SceInt32 try_take(MemState &mem, const ThreadStatePtr &thread, SceInt32 count);
++    // Gives the unlocked mutex to the first waiter, if there is one. The lock must be held.
++    void hand_over();
+     // Writes the owner and lock count to a lightweight mutex's work area, which the guest reads. The lock must be held.
+     void update_workarea(MemState &mem);
+ };
+@@ -246,6 +255,8 @@ public:
+     };
+ 
+     WaitQueue<WaitEntry> waiters;
++    // The pattern the event flag was created with, for its info
++    const SceUInt32 init_pattern;
+     SceUInt32 flags;
+ 
+ private:
+@@ -312,21 +323,20 @@ public:
+     std::expected<SceSize, SceInt32> send(const ThreadStatePtr &thread, SceUInt32 wait_mode, const void *buf, SceSize size, SceUInt32 *timeout, bool callbacks);
+     SceInt32 cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receive_wait_threads);
+ 
+-private:
+     struct WaitEntry {
+         SceSize request_size;
+         // Woken to recheck the buffer and has not done so yet
+         bool notified = false;
+     };
+ 
+-    void on_delete() override;
+-    // Wakes the first waiter whose request now fits and that was not woken already, so it retries its transfer
+-    static void wake_waiter(WaitQueue<WaitEntry> &waiters, std::size_t available);
+-
+-    // TODO do senders respect priority?
+     WaitQueue<WaitEntry> senders;
+     WaitQueue<WaitEntry> receivers;
+     ByteRingBuffer data_buffer;
++
++private:
++    void on_delete() override;
++    // Wakes the first waiter whose request now fits and that was not woken already, so it retries its transfer
++    static void wake_waiter(WaitQueue<WaitEntry> &waiters, std::size_t available);
+ };
+ 
+ typedef std::shared_ptr<MsgPipe> MsgPipePtr;
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 020416bd..ff7eaffc 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -69,7 +69,9 @@ struct ThreadState {
+     WaitTarget wait_target;
+ 
+     std::condition_variable status_cond;
+-    uint32_t returned_value = 0;
++    // The exit status the guest sees: DORMANT until the first start, NOT_DORMANT while the thread
++    // runs, then what it returned or exited with
++    uint32_t returned_value = SCE_KERNEL_ERROR_DORMANT;
+ 
+     ThreadState() = delete;
+     explicit ThreadState(SceUID id, KernelState &kernel, MemState &mem);
+diff --git a/vita3k/kernel/include/kernel/thread/wait_queue.h b/vita3k/kernel/include/kernel/thread/wait_queue.h
+index 4b0a9a75..1105a184 100644
+--- a/vita3k/kernel/include/kernel/thread/wait_queue.h
++++ b/vita3k/kernel/include/kernel/thread/wait_queue.h
+@@ -46,9 +46,17 @@ public:
+         std::optional<SceInt32> result;
+     };
+ 
++    // How the queue orders its waiters
++    enum class Order {
++        fifo,
++        priority,
++    };
++
+     WaitQueue() = default;
+     explicit WaitQueue(SceUInt32 attr)
+         : by_priority(attr & SCE_KERNEL_ATTR_TH_PRIO) {}
++    explicit WaitQueue(Order order)
++        : by_priority(order == Order::priority) {}
+ 
+     // Blocks thread on target until a waker gives it a result, ready() holds, it is being deleted, or the deadline passes.
+     // thread must be the guest thread making this HLE call. ready() is rechecked each time it is woken.
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index e41102f1..b9761ea3 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -86,6 +86,8 @@
+ 
+ // The bits that order the threads waiting on a message pipe, separately for senders and receivers
+ #define SCE_KERNEL_MSG_PIPE_ATTR_TH_MASK 0x0000000FU
++#define SCE_KERNEL_MSG_PIPE_ATTR_TH_PRIO_S 0x00000001U
++#define SCE_KERNEL_MSG_PIPE_ATTR_TH_PRIO_R 0x00000002U
+ 
+ #define SCE_KERNEL_MSG_PIPE_MODE_ASAP 0x00000000U
+ #define SCE_KERNEL_MSG_PIPE_MODE_FULL 0x00000001U
+@@ -756,7 +758,8 @@ struct SceKernelLwMutexInfo {
+ 
+ struct SceKernelLwCondWork {
+     SceUID uid;
+-    std::uint8_t padding[12];
++    SceUID lwMutexUid;
++    std::uint32_t unknown[2];
+ };
+ static_assert(sizeof(SceKernelLwCondWork) == 16, "Incorrect size");
+ 
+@@ -811,6 +814,17 @@ struct SceKernelCondInfo {
+     SceUInt32 numWaitThreads;
+ };
+ 
++struct SceKernelMppInfo {
++    SceSize size;
++    SceUID mppId;
++    char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
++    SceUInt32 attr;
++    SceInt32 bufSize;
++    SceInt32 freeSize;
++    SceInt32 numSendWaitThreads;
++    SceInt32 numReceiveWaitThreads;
++};
++
+ struct SceKernelEventFlagInfo {
+     SceSize size;
+     SceUID evfId;
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index badb49cf..f73efd37 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -151,6 +151,11 @@ void KernelState::invalidate_jit_cache(Address start, size_t length) {
+     }
+ }
+ 
++uint64_t KernelState::process_time_at(uint64_t clock_time) const {
++    // The process started at the host clock time start_tick - base_tick.tick
++    return clock_time - (start_tick - base_tick.tick);
++}
++
+ ThreadStatePtr KernelState::get_thread(SceUID thread_id) {
+     return lock_and_find(thread_id, threads, mutex);
+ }
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 443b6030..1a8374be 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -20,6 +20,7 @@
+ #include <kernel/sync_primitives.h>
+ 
+ #include <kernel/types.h>
++#include <util/align.h>
+ #include <util/log.h>
+ 
+ SyncPrimitive::SyncPrimitive(SceUInt32 attr, const char *name)
+@@ -240,8 +241,9 @@ void Timer::advance_next_event(uint64_t current_time) {
+ }
+ 
+ SceInt32 Timer::try_take(SceUInt32 *result_pattern, SceUInt64 *user_data, uint64_t current_time) {
++    // A take that fails gets no bits, like a simple event poll
+     if (result_pattern)
+-        *result_pattern = SCE_KERNEL_EVENT_TIMER;
++        *result_pattern = 0;
+     if (user_data)
+         *user_data = 0;
+ 
+@@ -257,6 +259,8 @@ SceInt32 Timer::try_take(SceUInt32 *result_pattern, SceUInt64 *user_data, uint64
+     if (!event_set)
+         return SCE_KERNEL_ERROR_EVENT_COND;
+ 
++    if (result_pattern)
++        *result_pattern = SCE_KERNEL_EVENT_TIMER;
+     if (attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)
+         event_set = false;
+ 
+@@ -314,6 +318,8 @@ SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, Sc
+ 
+     waiters.remove(waiter);
+     writeback_timeout(timeout, guest_deadline);
++    if (result_pattern)
++        *result_pattern = SCE_KERNEL_EVENT_TIMER;
+ 
+     event_set = !is_pulse && !(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET);
+     advance_next_event(current_time);
+@@ -348,8 +354,9 @@ SceInt32 Timer::start() {
+     if (is_started)
+         return 1;
+ 
++    // The count goes on from where it stopped
+     is_started = true;
+-    time = get_current_time();
++    base = get_current_time() - stopped_count;
+ 
+     if (event_interval != 0)
+         schedule_event();
+@@ -362,12 +369,14 @@ SceInt32 Timer::stop() {
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
+ 
+-    const bool was_stopped = !is_started;
++    if (!is_started)
++        return 0;
++
++    stopped_count = count();
+     is_started = false;
+-    time = get_current_time();
+     next_event = std::numeric_limits<uint64_t>::max();
+ 
+-    return static_cast<SceInt32>(was_stopped);
++    return 1;
+ }
+ 
+ std::expected<uint64_t, SceInt32> Timer::set_time(uint64_t new_time) {
+@@ -375,7 +384,16 @@ std::expected<uint64_t, SceInt32> Timer::set_time(uint64_t new_time) {
+     if (!guard)
+         return std::unexpected(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
+ 
+-    return std::exchange(time, new_time);
++    const uint64_t old_count = count();
++    if (is_started)
++        base = get_current_time() - new_time;
++    else
++        stopped_count = new_time;
++    return old_count;
++}
++
++uint64_t Timer::count() const {
++    return is_started ? get_current_time() - base : stopped_count;
+ }
+ 
+ SceInt32 Timer::cancel(SceUInt32 *num_wait_threads) {
+@@ -474,7 +492,7 @@ void Mutex::update_workarea(MemState &mem) {
+     if (!lightweight())
+         return;
+     workarea.get(mem)->lockCount = lock_count;
+-    workarea.get(mem)->owner = owner->id;
++    workarea.get(mem)->owner = owner ? owner->id : 0;
+ }
+ 
+ SceInt32 Mutex::acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 count, SceUInt32 *timeout, bool callbacks) {
+@@ -514,7 +532,7 @@ SceInt32 Mutex::try_acquire(MemState &mem, const ThreadStatePtr &thread, SceInt3
+     return try_take(mem, thread, count);
+ }
+ 
+-SceInt32 Mutex::release(const ThreadStatePtr &thread, SceInt32 unlock_count) {
++SceInt32 Mutex::release(MemState &mem, const ThreadStatePtr &thread, SceInt32 unlock_count) {
+     const auto guard = lock();
+     if (!guard)
+         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID : SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID;
+@@ -528,19 +546,27 @@ SceInt32 Mutex::release(const ThreadStatePtr &thread, SceInt32 unlock_count) {
+ 
+     lock_count -= unlock_count;
+ 
+-    if (lock_count == 0) {
+-        owner = nullptr;
+-
+-        if (auto *waiter = waiters.front()) {
+-            lock_count += waiter->entry.lock_count;
+-            owner = waiter->thread;
+-            waiters.wake(*waiter);
+-        }
+-    }
++    if (lock_count == 0)
++        hand_over();
++    update_workarea(mem);
+ 
+     return SCE_KERNEL_OK;
+ }
+ 
++void Mutex::release_ended_owner() {
++    lock_count = 0;
++    hand_over();
++}
++
++void Mutex::hand_over() {
++    owner = nullptr;
++    if (auto *waiter = waiters.front()) {
++        lock_count += waiter->entry.lock_count;
++        owner = waiter->thread;
++        waiters.wake(*waiter);
++    }
++}
++
+ SceInt32 Mutex::cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt32 *num_wait_threads) {
+     const auto guard = lock();
+     if (!guard)
+@@ -590,6 +616,11 @@ SceInt32 RWLock::try_take(const ThreadStatePtr &thread, bool is_write) {
+         return SCE_KERNEL_OK;
+     }
+ 
++    // A waiting writer goes before new readers
++    const bool writer_waits = waiters.find_if([](auto &waiter) { return waiter.entry.is_write; }) != nullptr;
++    if (!is_write && writer_waits)
++        return SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK;
++
+     // Readers share the lock, but a reader and a writer don't, even in the same thread
+     if (state == RWLockState::Unlocked || (!is_write && state == RWLockState::ReadLocked)) {
+         owners[thread]++;
+@@ -671,25 +702,18 @@ SceInt32 RWLock::release(const ThreadStatePtr &thread, bool is_write) {
+ 
+     state = RWLockState::Unlocked;
+ 
+-    bool woke_writer = false;
+-    waiters.wake_if([&](auto &waiter) {
+-        const bool waiting_is_write = waiter.entry.is_write;
+-
+-        if (woke_writer || (state == RWLockState::ReadLocked && waiting_is_write)) {
+-            // only awaken read threads
+-            return false;
+-        }
+-
+-        owners.emplace(waiter.thread, 1);
+-
+-        if (waiting_is_write) {
+-            state = RWLockState::WriteLocked;
+-            woke_writer = true;
+-        } else {
+-            state = RWLockState::ReadLocked;
+-        }
+-        return true;
+-    });
++    // The first waiting writer goes first, even before readers that waited longer. Without one,
++    // every waiting reader gets the lock at once.
++    if (auto *writer = waiters.find_if([](auto &waiter) { return waiter.entry.is_write; })) {
++        owners.emplace(writer->thread, 1);
++        state = RWLockState::WriteLocked;
++        waiters.wake(*writer);
++    } else if (waiters.wake_if([&](auto &waiter) {
++                   owners.emplace(waiter.thread, 1);
++                   return true;
++               })) {
++        state = RWLockState::ReadLocked;
++    }
+ 
+     return SCE_KERNEL_OK;
+ }
+@@ -840,7 +864,7 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
+     if (!guard)
+         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID : SCE_KERNEL_ERROR_UNKNOWN_COND_ID;
+ 
+-    if (const SceInt32 error = associated_mutex->release(thread, 1))
++    if (const SceInt32 error = associated_mutex->release(mem, thread, 1))
+         return error;
+ 
+     const Deadline deadline = deadline_from(timeout);
+@@ -877,6 +901,10 @@ SceInt32 Condvar::signal(SignalTarget target) {
+         if (!waiter)
+             return SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID;
+         waiters.wake(*waiter);
++    } else if (target.type == SignalTarget::Type::Any) {
++        // Wakes the first waiter in queue order
++        if (auto *waiter = waiters.front())
++            waiters.wake(*waiter);
+     } else {
+         waiters.wake_all();
+     }
+@@ -891,6 +919,7 @@ SceInt32 Condvar::signal(SignalTarget target) {
+ EventFlag::EventFlag(SceUInt32 attr, const char *name, SceUInt32 init_pattern)
+     : WithUidClass(attr, name)
+     , waiters(attr)
++    , init_pattern(init_pattern)
+     , flags(init_pattern) {}
+ 
+ SceInt32 EventFlag::check_create(const char *name, SceUInt32 attr) {
+@@ -1054,8 +1083,10 @@ SceInt32 EventFlag::cancel(SceUInt32 pattern, SceUInt32 *num_wait_threads) {
+ 
+ MsgPipe::MsgPipe(SceUInt32 attr, const char *name, std::size_t buf_size)
+     : WithUidClass(attr, name)
+-    , receivers(attr)
+-    , data_buffer(buf_size) {}
++    , senders(attr & SCE_KERNEL_MSG_PIPE_ATTR_TH_PRIO_S ? WaitQueue<WaitEntry>::Order::priority : WaitQueue<WaitEntry>::Order::fifo)
++    , receivers(attr & SCE_KERNEL_MSG_PIPE_ATTR_TH_PRIO_R ? WaitQueue<WaitEntry>::Order::priority : WaitQueue<WaitEntry>::Order::fifo)
++    // A pipe's buffer is a whole number of 4 KiB pages
++    , data_buffer(align(buf_size, 0x1000)) {}
+ 
+ SceInt32 MsgPipe::check_create(const char *name, SceUInt32 type, SceUInt32 attr, SceSize buf_size) {
+     if (const SceInt32 error = check_name(name, attr))
+@@ -1122,10 +1153,12 @@ std::expected<SceSize, SceInt32> MsgPipe::receive(const ThreadStatePtr &thread,
+ 
+         // sleep until we can read, if ASAP we can read as low as 1 byte
+         const WaitEntry entry{ .request_size = ASAP ? 1 : size };
+-        const WaitResult r = receivers.wait_until_ready(guard, thread, { SCE_KERNEL_WAITTYPE_MSG_PIPE, uid }, entry, deadline_from(timeout), callbacks, [&](auto &waiter) {
++        const Deadline deadline = deadline_from(timeout);
++        const WaitResult r = receivers.wait_until_ready(guard, thread, { SCE_KERNEL_WAITTYPE_MSG_PIPE, uid }, entry, deadline, callbacks, [&](auto &waiter) {
+             waiter.entry.notified = false;
+             return can_receive();
+         });
++        writeback_timeout(timeout, deadline);
+         // The thread is exiting, which the guest never sees
+         if (!r)
+             return 0;
+@@ -1163,10 +1196,12 @@ std::expected<SceSize, SceInt32> MsgPipe::send(const ThreadStatePtr &thread, Sce
+ 
+         // sleep until there's more space, if ASAP we can insert as low as 1 byte
+         const WaitEntry entry{ .request_size = ASAP ? 1 : size };
+-        const WaitResult r = senders.wait_until_ready(guard, thread, { SCE_KERNEL_WAITTYPE_MSG_PIPE, uid }, entry, deadline_from(timeout), callbacks, [&](auto &waiter) {
++        const Deadline deadline = deadline_from(timeout);
++        const WaitResult r = senders.wait_until_ready(guard, thread, { SCE_KERNEL_WAITTYPE_MSG_PIPE, uid }, entry, deadline, callbacks, [&](auto &waiter) {
+             waiter.entry.notified = false;
+             return can_send();
+         });
++        writeback_timeout(timeout, deadline);
+         // The thread is exiting, which the guest never sees
+         if (!r)
+             return 0;
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 7397bf7b..fede2ad4 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -19,6 +19,7 @@
+ #include <kernel/thread/thread_state.h>
+ 
+ #include <kernel/state.h>
++#include <kernel/sync_primitives.h>
+ #include <mem/ptr.h>
+ #include <util/align.h>
+ 
+@@ -114,9 +115,10 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback) {
+     std::unique_lock<std::mutex> thread_lock(mutex);
+     if (status != ThreadStatus::dormant)
+-        return SCE_KERNEL_ERROR_RUNNING;
++        return SCE_KERNEL_ERROR_NOT_DORMANT;
+ 
+     run_start_callback = run_entry_callback;
++    returned_value = SCE_KERNEL_ERROR_NOT_DORMANT;
+     load_context(*cpu, init_cpu_ctx);
+     write_pc(*cpu, entry_point);
+     write_lr(*cpu, kernel.halt_instruction_pc);
+@@ -205,6 +207,16 @@ void ThreadState::run_loop() {
+         returned_value = old_returned_value;
+     };
+ 
++    // A mutex the thread still holds when it ends goes to its next waiter
++    auto release_mutexes = [&]() {
++        lock.unlock();
++        kernel.objects.for_each<HeavyMutex>([&](Mutex &mutex) {
++            if (mutex.owner.get() == this)
++                mutex.release_ended_owner();
++        });
++        lock.lock();
++    };
++
+     while (true) {
+         // Check if this call-level is done (normal exit, guest return, or delete).
+         if (exit_requested || guest_returned || delete_requested) {
+@@ -214,6 +226,7 @@ void ThreadState::run_loop() {
+             // Top-level fires the end callback and parks dormant
+             if (top_level && status != ThreadStatus::dormant) {
+                 run_thread_end_callback();
++                release_mutexes();
+                 update_status(ThreadStatus::dormant);
+             }
+             // Return from nested levels to the top level (or completely if deleted)
+@@ -314,6 +327,7 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+     // save the current context before overwriting PC/LR for the callback
+     const CPUContext previous_ctx = save_context(*cpu);
+     const uint32_t previous_tpidruro = read_tpidruro(*cpu);
++    const uint32_t previous_returned_value = returned_value;
+ 
+     // we shouldn't have to clean the context I believe
+     write_pc(*cpu, callback_address);
+@@ -334,7 +348,11 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+     load_context(*cpu, previous_ctx);
+     write_tpidruro(*cpu, previous_tpidruro);
+ 
+-    return returned_value;
++    // The callback's result isn't the thread's exit status, unless the callback ended the thread
++    const uint32_t result = returned_value;
++    if (!exit_requested && !delete_requested)
++        returned_value = previous_returned_value;
++    return result;
+ }
+ 
+ void ThreadState::dispatch_abort(CPUState &cpu) {
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 545274f5..01f78c7e 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -66,6 +66,7 @@ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const
+     const auto mutex = std::make_shared<LwMutex>(attr, name, init_count, emuenv.kernel.get_thread(thread_id), workarea);
+     const SceUID uid = emuenv.kernel.objects.add(mutex, emuenv.kernel.get_next_uid());
+     SceKernelLwMutexWork *workarea_mem = workarea.get(emuenv.mem);
++    *workarea_mem = {};
+     workarea_mem->lockCount = init_count;
+     if (workarea_mem->lockCount)
+         workarea_mem->owner = thread_id;
+@@ -172,7 +173,10 @@ EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const cha
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+ 
+     const auto condvar = std::make_shared<LwCond>(attr, name, mutex);
+-    workarea.get(emuenv.mem)->uid = emuenv.kernel.objects.add(condvar, emuenv.kernel.get_next_uid());
++    SceKernelLwCondWork *work = workarea.get(emuenv.mem);
++    *work = {};
++    work->uid = emuenv.kernel.objects.add(condvar, emuenv.kernel.get_next_uid());
++    work->lwMutexUid = assoc_mutex_uid;
+     return SCE_KERNEL_OK;
+ }
+ 
+@@ -239,6 +243,8 @@ EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea) {
+     if (!emuenv.kernel.objects.remove<LwCond>(lightweight_condition_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+ 
++    workarea.get(emuenv.mem)->uid = SCE_UID_INVALID_UID;
++    workarea.get(emuenv.mem)->lwMutexUid = SCE_UID_INVALID_UID;
+     return SCE_KERNEL_OK;
+ }
+ 
+@@ -280,6 +286,7 @@ EXPORT(SceInt32, _sceKernelGetCallbackInfo, SceUID callbackId, SceKernelCallback
+     info.threadId = cb->thread_id;
+     info.callbackFunc = cb->cb_func;
+     info.notifyId = cb->get_notifier_id();
++    info.notifyCount = static_cast<SceInt32>(cb->get_num_notifications());
+     info.notifyArg = cb->get_notify_arg();
+     info.pCommon = cb->userdata;
+     write_info(pInfo, info);
+@@ -330,7 +337,7 @@ EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFla
+     full.evfId = evfId;
+     strncpy(full.name, eventflag->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
+     full.attr = eventflag->attr;
+-    full.initPattern = eventflag->flags; // Todo, give only current pattern
++    full.initPattern = eventflag->init_pattern;
+     full.currentPattern = eventflag->flags;
+     full.numWaitThreads = eventflag->waiters.size();
+     write_info(info, full);
+@@ -393,9 +400,27 @@ EXPORT(int, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKe
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, _sceKernelGetMsgPipeInfo) {
+-    TRACY_FUNC(_sceKernelGetMsgPipeInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetMsgPipeInfo, SceUID msgPipeId, SceKernelMppInfo *pInfo) {
++    TRACY_FUNC(_sceKernelGetMsgPipeInfo, msgPipeId, pInfo);
++    const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgPipeId);
++    const auto guard = msgpipe ? msgpipe->lock() : std::unique_lock<std::mutex>();
++    if (!guard)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
++    if (!pInfo)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    if (pInfo->size > sizeof(*pInfo))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++
++    SceKernelMppInfo info{};
++    info.mppId = msgPipeId;
++    strncpy(info.name, msgpipe->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
++    info.attr = msgpipe->attr;
++    info.bufSize = static_cast<SceInt32>(msgpipe->data_buffer.Capacity());
++    info.freeSize = static_cast<SceInt32>(msgpipe->data_buffer.Free());
++    info.numSendWaitThreads = static_cast<SceInt32>(msgpipe->senders.size());
++    info.numReceiveWaitThreads = static_cast<SceInt32>(msgpipe->receivers.size());
++    write_info(pInfo, info);
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, _sceKernelGetMutexInfo, SceUID mutexId, SceKernelMutexInfo *pInfo) {
+@@ -551,8 +576,6 @@ EXPORT(SceInt32, _sceKernelGetThreadCpuAffinityMask, SceUID thid) {
+ 
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+-    if (thread->affinity_mask == 0)
+-        return SCE_KERNEL_CPU_MASK_USER_ALL;
+ 
+     return thread->affinity_mask;
+ }
+@@ -568,12 +591,15 @@ EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
+     if (!thread) {
+         return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
+     }
++    if (!pExitStatus)
++        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
+     if (thread->status != ThreadStatus::dormant) {
+         return SCE_KERNEL_ERROR_NOT_DORMANT;
+     }
+-    if (pExitStatus) {
+-        *pExitStatus = thread->returned_value;
+-    }
++    // A thread that never started has no exit status yet
++    if (thread->returned_value == static_cast<uint32_t>(SCE_KERNEL_ERROR_DORMANT))
++        return SCE_KERNEL_ERROR_DORMANT;
++    *pExitStatus = thread->returned_value;
+     return 0;
+ }
+ 
+@@ -589,26 +615,26 @@ EXPORT(SceInt32, _sceKernelGetThreadInfo, SceUID threadId, Ptr<SceKernelThreadIn
+     if (!info)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+ 
+-    if (info->size != sizeof(*info))
+-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT_SIZE);
++    if (info->size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+ 
+     // TODO: SCE_KERNEL_ERROR_ILLEGAL_CONTEXT check
+ 
+     const std::lock_guard<std::mutex> lock(thread->mutex);
+-    strncpy(info->name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
+-    info->stack = Ptr<void>(thread->stack.get());
+-    info->stackSize = thread->stack_size;
+-    info->initPriority = thread->priority; // Todo Give only current priority
+-    info->currentPriority = thread->priority;
+-    info->initCpuAffinityMask = thread->affinity_mask; // Todo Give init affinity
+-    info->currentCpuAffinityMask = thread->affinity_mask;
+-    info->entry = SceKernelThreadEntry(thread->entry_point);
+-    info->status = std::to_underlying(thread->status);
+-    info->waitType = thread->wait_target.type;
+-    info->waitId = thread->wait_target.id;
+-    if (thread->status == ThreadStatus::dormant) {
+-        info->exitStatus = thread->returned_value;
+-    }
++    SceKernelThreadInfo full{};
++    strncpy(full.name, thread->name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH);
++    full.stack = Ptr<void>(thread->stack.get());
++    full.stackSize = thread->stack_size;
++    full.initPriority = thread->priority; // Todo Give only current priority
++    full.currentPriority = thread->priority;
++    full.initCpuAffinityMask = thread->affinity_mask; // Todo Give init affinity
++    full.currentCpuAffinityMask = thread->affinity_mask;
++    full.entry = SceKernelThreadEntry(thread->entry_point);
++    full.status = std::to_underlying(thread->status);
++    full.waitType = thread->wait_target.type;
++    full.waitId = thread->wait_target.id;
++    full.exitStatus = thread->returned_value;
++    write_info(info, full);
+     return SCE_KERNEL_OK;
+ }
+ 
+@@ -843,10 +869,6 @@ EXPORT(int, _sceKernelStartThread, SceUID thid, SceSize arglen, Ptr<void> argp)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+     }
+ 
+-    if (thread->status == ThreadStatus::running) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_RUNNING);
+-    }
+-
+     const int res = thread->start(arglen, argp, true);
+     if (res < 0) {
+         return RET_ERROR(res);
+@@ -1196,9 +1218,8 @@ EXPORT(int, sceKernelCreateThreadForUser, const char *name, SceKernelThreadEntry
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_PRIORITY);
+     if (options->stack_size <= 0)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_STACK_SIZE);
+-    if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL) {
+-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_CPU_AFFINITY);
+-    }
++    if (options->cpu_affinity_mask & ~SCE_KERNEL_CPU_MASK_USER_ALL)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_CPU_AFFINITY_MASK);
+     // The new thread starts at the creating thread's current priority
+     if (init_priority == SCE_KERNEL_CURRENT_THREAD_PRIORITY)
+         init_priority = emuenv.kernel.get_thread(thread_id)->priority;
+@@ -1314,6 +1335,9 @@ EXPORT(int, sceKernelDeleteSimpleEvent, SceUID event_id) {
+ 
+ EXPORT(int, sceKernelDeleteThread, SceUID thid) {
+     TRACY_FUNC(sceKernelDeleteThread, thid);
++    // A thread can't delete itself, it has to exit and delete
++    if (thid == thread_id)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thid);
+     if (!thread)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+@@ -1372,9 +1396,16 @@ EXPORT(SceInt32, sceKernelGetThreadCpuAffinityMask, SceUID thid) {
+     return CALL_EXPORT(_sceKernelGetThreadCpuAffinityMask, thid);
+ }
+ 
+-EXPORT(int, sceKernelGetThreadStackFreeSize) {
+-    TRACY_FUNC(sceKernelGetThreadStackFreeSize);
+-    return UNIMPLEMENTED();
++EXPORT(int, sceKernelGetThreadStackFreeSize, SceUID thid) {
++    TRACY_FUNC(sceKernelGetThreadStackFreeSize, thid);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thid ? thid : thread_id);
++    if (!thread)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
++
++    // A dormant thread's whole stack is free, a started one's is free below its stack pointer
++    if (thread->status == ThreadStatus::dormant)
++        return thread->stack_size;
++    return static_cast<int>(read_sp(*thread->cpu) - thread->stack.get());
+ }
+ 
+ EXPORT(Ptr<void>, sceKernelGetThreadTLSAddr, SceUID thid, int key) {
+@@ -1402,7 +1433,7 @@ EXPORT(uint64_t, sceKernelGetTimerBaseWide, SceUID timer_handle) {
+         return std::numeric_limits<uint64_t>::max();
+     }
+ 
+-    return timer->time;
++    return timer->base ? emuenv.kernel.process_time_at(timer->base) : 0;
+ }
+ 
+ EXPORT(uint64_t, sceKernelGetTimerTimeWide, SceUID timer_handle) {
+@@ -1416,7 +1447,7 @@ EXPORT(uint64_t, sceKernelGetTimerTimeWide, SceUID timer_handle) {
+         return std::numeric_limits<uint64_t>::max();
+     }
+ 
+-    return get_current_time() - timer->time;
++    return timer->count();
+ }
+ 
+ EXPORT(SceInt32, sceKernelNotifyCallback, SceUID callbackId, SceInt32 notifyArg) {
+@@ -1578,15 +1609,16 @@ EXPORT(SceInt32, sceKernelSetEventFlag, SceUID evfId, SceUInt32 bitPattern) {
+     return event->set(bitPattern);
+ }
+ 
+-EXPORT(int, sceKernelSetTimerTimeWide, SceUID timer_handle, SceUInt64 time) {
++EXPORT(SceUInt64, sceKernelSetTimerTimeWide, SceUID timer_handle, SceUInt64 time) {
+     TRACY_FUNC(sceKernelSetTimerTimeWide, timer_handle, time);
+     const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
+-    if (!timer)
+-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
++    const auto old_time = timer ? timer->set_time(time) : std::unexpected(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
+ 
+-    const auto old_time = timer->set_time(time);
+-    if (!old_time)
+-        return RET_ERROR(old_time.error());
++    // Like the time getters, an unknown timer gets all ones, which can't be taken for a time
++    if (!old_time) {
++        RET_ERROR(old_time.error());
++        return std::numeric_limits<uint64_t>::max();
++    }
+ 
+     return *old_time;
+ }
+@@ -1683,7 +1715,7 @@ EXPORT(int, sceKernelUnlockMutex, SceUID mutexid, int unlock_count) {
+     const MutexPtr mutex = emuenv.kernel.objects.find<HeavyMutex>(mutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
+-    return mutex->release(emuenv.kernel.get_thread(thread_id), unlock_count);
++    return mutex->release(emuenv.mem, emuenv.kernel.get_thread(thread_id), unlock_count);
+ }
+ 
+ EXPORT(int, sceKernelUnlockReadRWLock, SceUID lock_id) {
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+index 5d7310fc..dd371e66 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+@@ -30,6 +30,8 @@ struct sceKernelRegisterThreadEventHandlerOpt {
+ 
+ DECL_EXPORT(SceUID, _sceKernelCreateCond, const char *pName, SceUInt32 attr, SceUID mutexId, const SceKernelCondOptParam *pOptParam);
+ DECL_EXPORT(SceInt32, _sceKernelGetCondInfo, SceUID condId, Ptr<SceKernelCondInfo> pInfo);
++DECL_EXPORT(int, _sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus);
++DECL_EXPORT(SceInt32, _sceKernelGetMsgPipeInfo, SceUID msgPipeId, SceKernelMppInfo *pInfo);
+ DECL_EXPORT(SceUID, _sceKernelCreateSimpleEvent, const char *name, SceUInt32 attr, SceUInt32 init_pattern, const SceKernelSimpleEventOptParam *pOptParam);
+ DECL_EXPORT(int, _sceKernelCreateTimer, const char *name, SceUInt32 attr, const uint32_t *opt_params);
+ DECL_EXPORT(int, _sceKernelPollEvent, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
+@@ -37,6 +39,7 @@ DECL_EXPORT(int, _sceKernelWaitEvent, SceUID event_id, SceUInt32 bit_pattern, Sc
+ DECL_EXPORT(int, _sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout);
+ DECL_EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const char *name, unsigned int attr, Ptr<SceKernelCreateLwMutex_opt> opt);
+ DECL_EXPORT(int, _sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea);
++DECL_EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea);
+ DECL_EXPORT(int, _sceKernelLockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int lock_count, unsigned int *ptimeout);
+ DECL_EXPORT(int, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info, SceSize size);
+ DECL_EXPORT(SceUID, _sceKernelCreateRWLock, const char *name, SceUInt32 attr, SceKernelMutexOptParam *opt_param);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 3b88d869..f20dfd9b 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -54,12 +54,6 @@ enum class TimerFlags : uint32_t {
+ 
+ TRACY_MODULE_NAME(SceLibKernel);
+ 
+-inline static uint64_t get_current_time() {
+-    return std::chrono::duration_cast<std::chrono::microseconds>(
+-        std::chrono::high_resolution_clock::now().time_since_epoch())
+-        .count();
+-}
+-
+ VAR_EXPORT(__sce_libcparam) {
+     // This variable almost newer used. So I return something that looks good, but not exacly correct.
+     return (emuenv.kernel.process_param ? emuenv.kernel.process_param.get(emuenv.mem)->sce_libc_param.address() : 0);
+@@ -1286,12 +1280,7 @@ EXPORT(SceUID, sceKernelCreateTimer, const char *name, SceUInt32 attr, const uin
+ 
+ EXPORT(int, sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea) {
+     TRACY_FUNC(sceKernelDeleteLwCond, workarea);
+-    SceUID lightweight_condition_id = workarea.get(emuenv.mem)->uid;
+-
+-    if (!emuenv.kernel.objects.remove<LwCond>(lightweight_condition_id))
+-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+-
+-    return SCE_KERNEL_OK;
++    return CALL_EXPORT(_sceKernelDeleteLwCond, workarea);
+ }
+ 
+ EXPORT(int, sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
+@@ -1372,9 +1361,9 @@ EXPORT(int, sceKernelGetModuleInfoByAddr, Ptr<void> addr, SceKernelModuleInfo *i
+     return RET_ERROR(SCE_KERNEL_ERROR_MODULEMGR_NOENT);
+ }
+ 
+-EXPORT(int, sceKernelGetMsgPipeInfo) {
+-    TRACY_FUNC(sceKernelGetMsgPipeInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetMsgPipeInfo, SceUID msgPipeId, SceKernelMppInfo *pInfo) {
++    TRACY_FUNC(sceKernelGetMsgPipeInfo, msgPipeId, pInfo);
++    return CALL_EXPORT(_sceKernelGetMsgPipeInfo, msgPipeId, pInfo);
+ }
+ 
+ EXPORT(int, sceKernelGetMutexInfo, SceUID mutexId, SceKernelMutexInfo *info) {
+@@ -1471,17 +1460,7 @@ EXPORT(int, sceKernelGetThreadEventInfo) {
+ 
+ EXPORT(int, sceKernelGetThreadExitStatus, SceUID thid, SceInt32 *pExitStatus) {
+     TRACY_FUNC(sceKernelGetThreadExitStatus, thid, pExitStatus);
+-    const ThreadStatePtr thread = emuenv.kernel.get_thread(thid ? thid : thread_id);
+-    if (!thread) {
+-        return SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID;
+-    }
+-    if (thread->status != ThreadStatus::dormant) {
+-        return SCE_KERNEL_ERROR_NOT_DORMANT;
+-    }
+-    if (pExitStatus) {
+-        *pExitStatus = thread->returned_value;
+-    }
+-    return 0;
++    return CALL_EXPORT(_sceKernelGetThreadExitStatus, thid, pExitStatus);
+ }
+ 
+ EXPORT(int, sceKernelGetThreadId) {
+@@ -1507,7 +1486,7 @@ EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time)
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
+ 
+-    *time = timer->time;
++    *time = timer->base ? emuenv.kernel.process_time_at(timer->base) : 0;
+ 
+     return 0;
+ }
+@@ -1530,7 +1509,7 @@ EXPORT(int, sceKernelGetTimerTime, SceUID timer_handle, SceKernelSysClock *time)
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
+ 
+-    *time = get_current_time() - timer->time;
++    *time = timer->count();
+ 
+     return 0;
+ }
+@@ -1846,7 +1825,7 @@ EXPORT(int, sceKernelUnlockLwMutex, Ptr<SceKernelLwMutexWork> workarea, int unlo
+     const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+-    return mutex->release(emuenv.kernel.get_thread(thread_id), unlock_count);
++    return mutex->release(emuenv.mem, emuenv.kernel.get_thread(thread_id), unlock_count);
+ }
+ 
+ EXPORT(int, sceKernelUnlockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int unlock_count) {
+@@ -1860,7 +1839,7 @@ EXPORT(int, sceKernelUnlockLwMutex2, Ptr<SceKernelLwMutexWork> workarea, int unl
+     const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+-    return mutex->release(emuenv.kernel.get_thread(thread_id), unlock_count);
++    return mutex->release(emuenv.mem, emuenv.kernel.get_thread(thread_id), unlock_count);
+ }
+ 
+ EXPORT(SceInt32, sceKernelWaitCond, SceUID condId, SceUInt32 *pTimeout) {
+-- 
+2.54.0.windows.1
+

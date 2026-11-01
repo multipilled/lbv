@@ -1,0 +1,632 @@
+From 123fac93a5a99f711aaade5579cb03b1e460cf28 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Fri, 16 Oct 2026 01:21:41 +0900
+Subject: [PATCH 26/52] kernel: Thread ending cleanup (#4249)
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the latest VitaAutotests commit, which adds two
+tests and gives event_flag_multi_waiters' waiters a timeout far past its
+checks:
+- owner_end_more covers the cases owner_end leaves out of what happens to
+  a lock whose owner thread ends. It fails for the same reason owner_end
+  does, a write lock stays locked when its owner ends.
+- thread_delete_lookup checks that a deleted thread can't be found right
+  after its delete. It fails, since Vita3K keeps a deleted thread in its
+  table, dormant, until its host thread ends.
+
+* kernel: drop the unused thread start tick
+
+ThreadState::start_tick was set when a thread was created and never read.
+
+* kernel: pass whether a run loop is the top level
+
+ThreadState counted nested run_loop calls only to tell the host thread's
+top level from the nested levels callbacks run in. The callers know which
+one they are, so run_callback now says so, and the count goes away. Its
+check that a callback never starts a thread's first level goes too, since
+every caller runs the callback on its own thread from inside an import.
+
+* kernel: track how a thread ends in one value
+
+Three flags described how a thread ends: exit_requested, delete_requested
+and run_end_callback, which only told an exit-delete from a removal that
+skips the end handler. They're now one Ending value, where a stronger
+request replaces a weaker one, set by one call each:
+- exit(status) for sceKernelExitThread and a return from the entry.
+- exit_delete(status) for sceKernelExitDeleteThread, which used to need
+  exit() first only to store the exit status.
+- remove() for deleting a dormant thread, the module start and stop
+  threads, and the process teardown, which called exit_delete(false).
+
+sceGxmTerminate's display queue thread is dormant by then, so it's removed
+too, which never ran its end handler before either. A removal that lands
+while the thread returns from its entry now skips the end handler, like
+any other removal.
+
+* kernel: release a write lock when its owner ends
+
+A thread that ends holding a reader/writer lock for writing gives it up
+on a Vita, the way it gives up a mutex, so a waiting writer or every
+waiting reader gets it. Vita3K kept it locked by the ended thread. A read
+lock stays held on a Vita, and still does. owner_end and owner_end_more
+pass.
+
+* kernel: make a deleted thread gone for guest calls at once
+
+On a Vita a thread is gone once sceKernelDeleteThread returns for it, and
+a thread that exits and deletes itself is gone once its end wait returns,
+without ever showing as DORMANT. Vita3K kept both in the thread table
+until their host thread ended, so a lookup right after could still find
+them, dormant.
+
+A deleted thread now takes the DELETED status, which guest lookups skip:
+a dormant one as soon as it's removed, and one that ran instead of
+DORMANT, right before its end waiters wake. It stays in the thread table
+until its host thread ends, as before. The host thread gets its thread
+passed in instead of looking it up, since the guest may delete the thread
+before it starts. thread_delete_lookup passes.
+
+* debug: handle a deleted thread in the gdb stub and the threads view
+
+When the gdb stub stops the world, it suspends each running thread and
+waits until it's suspended or dormant. A thread that exits and deletes
+itself meanwhile now ends as DELETED, so that wait would never end. It
+now accepts DELETED too. The debug widget's thread list also names the
+status instead of showing it as unknown.
+
+(cherry picked from commit cf12e2b038123ce5fab269a9044a5b0a3ff6e866)
+---
+ vita3k/gdbstub/src/gdb.cpp                    |   3 +-
+ vita3k/gui-qt/src/debug_widget.cpp            |   2 +
+ .../kernel/include/kernel/sync_primitives.h   |   6 ++
+ .../include/kernel/thread/thread_state.h      |  44 +++++---
+ vita3k/kernel/src/kernel.cpp                  |  17 +--
+ vita3k/kernel/src/sync_primitives.cpp         |  15 ++-
+ vita3k/kernel/src/thread.cpp                  | 101 +++++++++---------
+ vita3k/modules/SceGxm/SceGxm.cpp              |   3 +-
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       |   6 +-
+ vita3k/modules/module_parent.cpp              |   4 +-
+ 10 files changed, 118 insertions(+), 83 deletions(-)
+
+diff --git a/vita3k/gdbstub/src/gdb.cpp b/vita3k/gdbstub/src/gdb.cpp
+index 47e66334..67bfed91 100644
+--- a/vita3k/gdbstub/src/gdb.cpp
++++ b/vita3k/gdbstub/src/gdb.cpp
+@@ -499,7 +499,8 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+                         auto thread = pair.second;
+                         if (thread->status == ThreadStatus::running) {
+                             thread->suspend();
+-                            thread->status_cond.wait(lock, [=]() { return thread->status == ThreadStatus::suspended || thread->status == ThreadStatus::dormant; });
++                            // A thread that ends meanwhile stops as dormant, or as deleted if it deletes itself
++                            thread->status_cond.wait(lock, [=]() { return thread->status == ThreadStatus::suspended || thread->status == ThreadStatus::dormant || thread->status == ThreadStatus::deleted; });
+                         }
+                     }
+                 }
+diff --git a/vita3k/gui-qt/src/debug_widget.cpp b/vita3k/gui-qt/src/debug_widget.cpp
+index ab1f3e9c..e139edba 100644
+--- a/vita3k/gui-qt/src/debug_widget.cpp
++++ b/vita3k/gui-qt/src/debug_widget.cpp
+@@ -218,6 +218,8 @@ static QString thread_status_string(ThreadStatus status) {
+         return QStringLiteral("Waiting");
+     case ThreadStatus::dormant:
+         return QStringLiteral("Dormant");
++    case ThreadStatus::deleted:
++        return QStringLiteral("Deleted");
+     case ThreadStatus::suspended:
+         return QStringLiteral("Suspended");
+     default:
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 7e36acef..40d71852 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -213,6 +213,9 @@ public:
+     SceInt32 release_read(const ThreadStatePtr &thread);
+     SceInt32 release_write(const ThreadStatePtr &thread);
+     SceInt32 cancel(const ThreadStatePtr &thread, SceUInt32 *num_read_wait_threads, SceUInt32 *num_write_wait_threads, SceInt32 flag);
++    // Releases the write lock if thread, which is ending, holds it. A read lock stays held, like on
++    // a Vita. The lock must be held.
++    void release_ended_writer(const ThreadState &thread);
+ 
+     struct WaitEntry {
+         bool is_write;
+@@ -230,6 +233,9 @@ private:
+     SceInt32 release(const ThreadStatePtr &thread, bool is_write);
+     // Takes the lock if it is free for this kind of lock, or returns why it can't. The lock must be held.
+     SceInt32 try_take(const ThreadStatePtr &thread, bool is_write);
++    // Unlocks the lock nobody holds anymore, and gives it to the waiters that get it next. The lock
++    // must be held.
++    void hand_over();
+ };
+ 
+ typedef std::shared_ptr<RWLock> RWLockPtr;
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 078d1406..aa48d571 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -24,6 +24,7 @@
+ #include <mem/block.h>
+ #include <mem/ptr.h>
+ 
++#include <algorithm>
+ #include <condition_variable>
+ #include <list>
+ #include <mutex>
+@@ -56,6 +57,7 @@ enum class ThreadStatus : SceUInt32 {
+     running = SCE_KERNEL_THREAD_STATUS_RUNNING,
+     waiting = SCE_KERNEL_THREAD_STATUS_WAITING, // Waiting to be awaken by sync object or operation
+     dormant = SCE_KERNEL_THREAD_STATUS_DORMANT, // Waiting for a job
++    deleted = SCE_KERNEL_THREAD_STATUS_DELETED, // Gone for guest calls, until its host thread ends
+     suspended = SCE_KERNEL_THREAD_STATUS_SUSPENDED, // Suspended by debugger
+ };
+ 
+@@ -73,7 +75,6 @@ struct ThreadState {
+     SceUInt32 attr = THREAD_ATTR_USER;
+     int priority;
+     SceInt32 affinity_mask;
+-    uint64_t start_tick;
+     uint64_t last_vblank_waited;
+ 
+     CPUStatePtr cpu;
+@@ -91,13 +92,22 @@ struct ThreadState {
+ 
+     int init(const char *name, Ptr<const void> entry_point, int init_priority, SceInt32 affinity_mask, int stack_size, const SceKernelThreadOptParam *option);
+     int start(SceSize arglen, const Ptr<void> argp, bool run_entry_callback = false);
++    // Ends the thread like sceKernelExitThread: the end handler runs, then it parks dormant
+     void exit(SceInt32 status);
+-    void exit_delete(bool exit = true);
++    // Ends the thread like sceKernelExitDeleteThread: the end handler runs, then it's deleted
++    void exit_delete(SceInt32 status);
++    // Deletes a dormant thread, or one being torn down, without running its end handler
++    void remove();
+ 
+     void update_status(ThreadStatus status, std::optional<ThreadStatus> expected = std::nullopt);
++    // Whether the thread is deleted, so guest calls can't find it
++    bool is_deleted();
+     Address stack_top() const;
+ 
+-    void run_loop();
++    // Runs the thread's guest code. The host thread runs the top level, which parks the thread
++    // dormant between starts until it's deleted. A callback runs a nested level, which returns
++    // when the callback does or the thread ends.
++    void run_loop(bool top_level = true);
+ 
+     // this function must be called from the thread itself (inside a svc call)
+     // With fresh_vfp_state, the call starts with the FPSCR and VFP exception setting of a new thread
+@@ -155,8 +165,21 @@ struct ThreadState {
+     std::string log_stack_traceback() const;
+ 
+ private:
+-    // Whether the thread is exiting or being deleted. Called with mutex held.
+-    bool exiting() const { return exit_requested || delete_requested; }
++    // How a thread ends, each value stronger than the ones before it
++    enum class Ending : uint8_t {
++        none,
++        // An exit, or a return from the entry: the end handler runs, then the thread parks dormant
++        exit,
++        // The end handler runs, then the host thread ends
++        exit_delete,
++        // The host thread ends without running the end handler
++        remove,
++    };
++
++    // Whether the thread is ending. Called with mutex held.
++    bool exiting() const { return ending != Ending::none; }
++    // Asks the thread to end, keeping a stronger request already made. Called with mutex held.
++    void request_ending(Ending how) { ending = std::max(ending, how); }
+ 
+     void push_arguments(const std::vector<uint32_t> &args);
+     void dispatch_abort(CPUState &cpu);
+@@ -164,10 +187,7 @@ private:
+     KernelState &kernel;
+ 
+     CPUContext init_cpu_ctx;
+-    // sceKernelExitThread (or top-level guest function return): park at dormant, thread reusable via start() / run_guest_function().
+-    bool exit_requested = false;
+-    // sceKernelExitDeleteThread (or external kill): will return from top-level run_loop(), then host thread joins.
+-    bool delete_requested = false;
++    Ending ending = Ending::none;
+     // Set by suspend(), consumed in run_loop() to transition to ThreadStatus::suspended.
+     bool suspend_requested = false;
+     // Set while suspend(), a step or a breakpoint holds the thread suspended, until resume().
+@@ -178,14 +198,8 @@ private:
+     // Single stepping mode.
+     bool single_stepping = false;
+ 
+-    // Number of active run_loop frames. The top-level host thread keeps one
+-    // frame alive (run_loop()) while parked dormant; callbacks add nested frames.
+-    int call_level = 0;
+-
+     // when calling sceKernelStartThread
+     bool run_start_callback = false;
+-    // when calling sceKernelExitThread or sceKernelExitDeleteThread
+-    bool run_end_callback = false;
+ 
+     MemState &mem;
+ 
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index f0acee9b..3268736d 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -54,15 +54,16 @@ void CorenumAllocator::set_max_core_count(const std::size_t max) {
+ // TODO implement cross platform debug thread name setter and eliminate SDL thread
+ struct ThreadParams {
+     KernelState *kernel = nullptr;
+-    SceUID thid = SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID;
++    // Passed in rather than looked up, since the guest may delete the thread before it starts
++    ThreadStatePtr thread;
+     SDL_Semaphore *host_may_destroy_params = nullptr;
+ };
+ 
+ static int SDLCALL thread_function(void *data) {
+     assert(data != nullptr);
+-    const ThreadParams params = *static_cast<const ThreadParams *>(data);
++    ThreadParams params = *static_cast<const ThreadParams *>(data);
+     SDL_SignalSemaphore(params.host_may_destroy_params);
+-    ThreadStatePtr thread = params.kernel->get_thread(params.thid);
++    ThreadStatePtr thread = std::move(params.thread);
+ #ifdef TRACY_ENABLE
+     if (!thread->name.empty()) {
+         tracy::SetThreadName(thread->name.c_str());
+@@ -157,7 +158,11 @@ uint64_t KernelState::process_time_at(uint64_t clock_time) const {
+ }
+ 
+ ThreadStatePtr KernelState::get_thread(SceUID thread_id) {
+-    return lock_and_find(thread_id, threads, mutex);
++    const ThreadStatePtr thread = lock_and_find(thread_id, threads, mutex);
++    // A deleted thread stays in threads until its host thread ends, but guest calls can't find it
++    if (thread && thread->is_deleted())
++        return nullptr;
++    return thread;
+ }
+ 
+ SceUID KernelState::create_callback(const ThreadStatePtr &thread, const char *name, Ptr<SceKernelCallbackFunction> func, Ptr<void> common) {
+@@ -189,7 +194,7 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
+ 
+     ThreadParams params;
+     params.kernel = this;
+-    params.thid = thread->id;
++    params.thread = thread;
+ 
+     params.host_may_destroy_params = SDL_CreateSemaphore(0);
+     // Recompiled code runs guest calls as host calls: give it a deep host stack (reserved, not
+@@ -229,7 +234,7 @@ void KernelState::process_exit() {
+     {
+         std::lock_guard<std::mutex> lock(mutex);
+         for (auto &[_, thread] : threads)
+-            thread->exit_delete(false);
++            thread->remove();
+     }
+ 
+     std::unique_lock<std::mutex> lock(mutex);
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 729c8194..36f54c41 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -701,6 +701,19 @@ SceInt32 RWLock::release(const ThreadStatePtr &thread, bool is_write) {
+     if (!owners.empty())
+         return SCE_KERNEL_OK;
+ 
++    hand_over();
++    return SCE_KERNEL_OK;
++}
++
++void RWLock::release_ended_writer(const ThreadState &thread) {
++    // A write lock has a single owner, whatever its count
++    if (state != RWLockState::WriteLocked || owners.empty() || owners.begin()->first.get() != &thread)
++        return;
++    owners.clear();
++    hand_over();
++}
++
++void RWLock::hand_over() {
+     state = RWLockState::Unlocked;
+ 
+     // The first waiting writer goes first, even before readers that waited longer. Without one,
+@@ -715,8 +728,6 @@ SceInt32 RWLock::release(const ThreadStatePtr &thread, bool is_write) {
+                })) {
+         state = RWLockState::ReadLocked;
+     }
+-
+-    return SCE_KERNEL_OK;
+ }
+ 
+ SceInt32 RWLock::cancel(const ThreadStatePtr &thread, SceUInt32 *num_read_wait_threads, SceUInt32 *num_write_wait_threads, SceInt32 flag) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 77a28999..b565634c 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -59,7 +59,6 @@ int ThreadState::init(const char *name, Ptr<const void> entry_point, int init_pr
+     }
+     this->affinity_mask = affinity_mask;
+     this->stack_size = stack_size;
+-    start_tick = rtc_get_ticks(kernel.base_tick.tick);
+     last_vblank_waited = 0;
+ 
+     cpu = init_cpu(kernel.cpu_opt, id, static_cast<std::size_t>(core_num), mem);
+@@ -154,18 +153,23 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
+ 
+ void ThreadState::exit(SceInt32 status) {
+     std::lock_guard<std::mutex> guard(mutex);
+-    run_end_callback = true;
+-    exit_requested = true;
++    request_ending(Ending::exit);
+     returned_value = static_cast<uint32_t>(status);
+     cpu->aot_unwind = true;
+ }
+ 
+-void ThreadState::exit_delete(bool exit) {
++void ThreadState::exit_delete(SceInt32 status) {
+     std::lock_guard<std::mutex> lock(mutex);
++    request_ending(Ending::exit_delete);
++    returned_value = static_cast<uint32_t>(status);
++}
+ 
+-    run_end_callback = exit;
+-    delete_requested = true;
+-    cpu->aot_unwind = true;
++void ThreadState::remove() {
++    std::lock_guard<std::mutex> lock(mutex);
++    request_ending(Ending::remove);
++    // A dormant thread is gone at once
++    if (status == ThreadStatus::dormant)
++        update_status(ThreadStatus::deleted);
+ 
+     if (status == ThreadStatus::running)
+         stop(*cpu);
+@@ -177,7 +181,7 @@ void ThreadState::exit_delete(bool exit) {
+     wait_cv.notify_all();
+ }
+ 
+-void ThreadState::run_loop() {
++void ThreadState::run_loop(bool top_level) {
+     bool guest_returned = false;
+ 
+     // Set thread-local CPU state so signal handlers can access it. The guard puts back what was
+@@ -190,22 +194,15 @@ void ThreadState::run_loop() {
+     set_current_cpu_state(cpu.get());
+ 
+     std::unique_lock<std::mutex> lock(mutex);
+-    ++call_level;
+-    const bool top_level = call_level == 1;
+ 
+     auto run_thread_end_callback = [&]() {
+-        if (!run_end_callback)
+-            return;
+-        run_end_callback = false;
+-
+         if (!kernel.thread_event_end)
+             return;
+ 
+         const ThreadStatus old_status = status;
+         const uint32_t old_returned_value = returned_value;
+-        // The handler runs guest code on this thread, which an exit or delete request would end at once
+-        const bool old_exit_requested = std::exchange(exit_requested, false);
+-        const bool old_delete_requested = std::exchange(delete_requested, false);
++        // The handler runs guest code on this thread, which a pending ending would end at once
++        const Ending old_ending = std::exchange(ending, Ending::none);
+         status = ThreadStatus::running;
+ 
+         lock.unlock();
+@@ -217,18 +214,18 @@ void ThreadState::run_loop() {
+ 
+         status = old_status;
+         returned_value = old_returned_value;
+-        // Keeping any request that came while the handler ran, like a teardown's delete
+-        exit_requested = exit_requested || old_exit_requested;
+-        delete_requested = delete_requested || old_delete_requested;
++        // Keeping a stronger request that came while the handler ran, like a teardown's remove
++        request_ending(old_ending);
+     };
+ 
+-    // A mutex the thread still holds when it ends goes to its next waiter
+-    auto release_mutexes = [&]() {
++    // A mutex or a write lock the thread still holds when it ends goes to its next waiter
++    auto release_locks = [&]() {
+         lock.unlock();
+         kernel.objects.for_each<HeavyMutex>([&](Mutex &mutex) {
+             if (mutex.owner.get() == this)
+                 mutex.release_ended_owner();
+         });
++        kernel.objects.for_each<RWLock>([&](RWLock &rwlock) { rwlock.release_ended_writer(*this); });
+         lock.lock();
+     };
+ 
+@@ -244,33 +241,34 @@ void ThreadState::run_loop() {
+     };
+ 
+     while (true) {
+-        // Check if this call-level is done (normal exit, guest return, or delete).
+-        if (exit_requested || guest_returned || delete_requested) {
+-            // native frames are gone once the top level sees the exit
+-            if (top_level)
+-                cpu->aot_unwind = false;
+-            // Top-level fires the end callback and parks dormant
+-            if (top_level && status != ThreadStatus::dormant) {
+-                // A thread that returns from its entry ends like one that exits, end handler included
+-                if (guest_returned)
+-                    run_end_callback = true;
+-                run_thread_end_callback();
+-                release_mutexes();
++        // This level is done once its guest function returned or the thread is ending
++        if (exiting() || guest_returned) {
++            // A nested level returns to the one below it
++            if (!top_level)
++                break;
++            // A thread that returns from its entry ends like one that exits, end handler included
++            if (guest_returned)
++                request_ending(Ending::exit);
++            // The top level ends a thread that ran. An exit leaves it dormant, while a delete makes
++            // it gone for guest calls before its end waiters wake.
++            if (status != ThreadStatus::dormant && status != ThreadStatus::deleted) {
++                if (ending != Ending::remove)
++                    run_thread_end_callback();
++                release_locks();
+                 delete_callbacks();
+-                update_status(ThreadStatus::dormant);
++                update_status(ending == Ending::exit ? ThreadStatus::dormant : ThreadStatus::deleted);
+             }
+-            // Return from nested levels to the top level (or completely if deleted)
+-            if (!top_level || delete_requested)
++            if (ending != Ending::exit)
+                 break;
+-            exit_requested = false;
++            ending = Ending::none;
+             guest_returned = false;
+-            // Status is now dormant: we'll park until the next start() or exit_delete().
++            // Status is now dormant: we'll park until the next start() or a delete
+         }
+ 
+         // Park until we have something to do.
+         if (status != ThreadStatus::running || pause_requested) {
+             status_cond.wait(lock, [&] {
+-                return (status == ThreadStatus::running && !pause_requested) || delete_requested;
++                return (status == ThreadStatus::running && !pause_requested) || exiting();
+             });
+             continue;
+         }
+@@ -289,7 +287,7 @@ void ThreadState::run_loop() {
+         }
+ 
+         // Active JIT loop. Lock held on entry and exit; unlocked only around run/step.
+-        while (!delete_requested && !exit_requested && !guest_returned && status == ThreadStatus::running) {
++        while (!exiting() && !guest_returned && status == ThreadStatus::running) {
+             const bool do_step = single_stepping;
+             if (do_step)
+                 single_stepping = false;
+@@ -334,8 +332,6 @@ void ThreadState::run_loop() {
+             }
+         }
+     }
+-
+-    --call_level;
+ }
+ 
+ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
+@@ -354,10 +350,6 @@ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
+ 
+ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<uint32_t> &args, bool fresh_vfp_state) {
+     std::unique_lock<std::mutex> thread_lock(mutex);
+-    if (call_level == 0) {
+-        LOG_ERROR("run_callback should not be called as the first thread entry");
+-        return 0;
+-    }
+ 
+     // save the current context before overwriting PC/LR for the callback
+     const CPUContext previous_ctx = save_context(*cpu);
+@@ -380,7 +372,7 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+ 
+     // unlock but then immediately lock back in the run_loop function
+     // shouldn't cause an issue, but maybe we could use a recursive mutex instead
+-    run_loop();
++    run_loop(false);
+ 
+     thread_lock.lock();
+ 
+@@ -396,7 +388,7 @@ uint32_t ThreadState::run_callback(Address callback_address, const std::vector<u
+ 
+     // The callback's result isn't the thread's exit status, unless the callback ended the thread
+     const uint32_t result = returned_value;
+-    if (!exit_requested && !delete_requested)
++    if (!exiting())
+         returned_value = previous_returned_value;
+     return result;
+ }
+@@ -441,7 +433,7 @@ uint32_t ThreadState::run_guest_function(Address callback_address, SceSize args,
+     start(args, argp);
+     {
+         std::unique_lock<std::mutex> lock(mutex);
+-        status_cond.wait(lock, [&]() { return status == ThreadStatus::dormant; });
++        status_cond.wait(lock, [&]() { return status == ThreadStatus::dormant || status == ThreadStatus::deleted; });
+     }
+ 
+     entry_point = old_entry_point;
+@@ -461,7 +453,7 @@ void ThreadState::update_status(ThreadStatus status, std::optional<ThreadStatus>
+     this->status = status;
+     status_cond.notify_all();
+ 
+-    if (status == ThreadStatus::dormant) {
++    if (status == ThreadStatus::dormant || status == ThreadStatus::deleted) {
+         const std::lock_guard<std::mutex> end_lock(end_waiters_mutex);
+         end_waiters.wake_if([&](auto &waiter) {
+             if (waiter.entry.exit_status)
+@@ -512,9 +504,14 @@ SceInt32 ThreadState::send_signal() {
+     return SCE_KERNEL_OK;
+ }
+ 
++bool ThreadState::is_deleted() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    return status == ThreadStatus::deleted;
++}
++
+ WaitResult ThreadState::wait_for_thread_end(const ThreadStatePtr &waiter, SceInt32 *exit_status, Deadline deadline, bool callbacks) {
+     std::unique_lock<std::mutex> lock(mutex);
+-    if (status == ThreadStatus::dormant) {
++    if (status == ThreadStatus::dormant || status == ThreadStatus::deleted) {
+         if (exit_status)
+             *exit_status = static_cast<SceInt32>(returned_value);
+         return SCE_KERNEL_OK;
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index 9de83527..a959269e 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -4988,7 +4988,8 @@ EXPORT(int, sceGxmTerminate) {
+     // a later sceGxmInitialize reassigns this std::thread, which terminates if still joinable
+     if (emuenv.gxm.display_host_thread.joinable())
+         emuenv.gxm.display_host_thread.join();
+-    emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->exit_delete();
++    // The display queue thread is dormant once the host thread that ran it was joined
++    emuenv.kernel.get_thread(emuenv.gxm.display_queue_thread)->remove();
+     return 0;
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 9b983fbf..19ca641e 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -1398,7 +1398,7 @@ EXPORT(int, sceKernelDeleteThread, SceUID thid) {
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+     if (thread->status != ThreadStatus::dormant)
+         return RET_ERROR(SCE_KERNEL_ERROR_NOT_DORMANT);
+-    thread->exit_delete(false);
++    thread->remove();
+     return 0;
+ }
+ 
+@@ -1413,9 +1413,7 @@ EXPORT(int, sceKernelDeleteTimer, SceUID timer_handle) {
+ EXPORT(int, sceKernelExitDeleteThread, int status) {
+     TRACY_FUNC(sceKernelExitDeleteThread, status);
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+-    // Record the exit status for sceKernelWaitThreadEnd, then delete
+-    thread->exit(status);
+-    thread->exit_delete();
++    thread->exit_delete(status);
+ 
+     return status;
+ }
+diff --git a/vita3k/modules/module_parent.cpp b/vita3k/modules/module_parent.cpp
+index ab695b6d..02f0d07a 100644
+--- a/vita3k/modules/module_parent.cpp
++++ b/vita3k/modules/module_parent.cpp
+@@ -412,7 +412,7 @@ uint32_t start_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sc
+         const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_start, priority, affinity, stack_size, nullptr);
+ 
+         const uint32_t ret = module_thread->run_guest_function(module_start.address(), args, argp.cast<void>());
+-        module_thread->exit_delete(false);
++        module_thread->remove();
+ 
+         LOG_INFO("Module {} (at \"{}\") module_start returned {}", module_name, module.path, log_hex(ret));
+         if (ret != SCE_KERNEL_START_SUCCESS)
+@@ -436,7 +436,7 @@ uint32_t stop_module(EmuEnvState &emuenv, const SceKernelModuleInfo &module, Sce
+         const ThreadStatePtr module_thread = emuenv.kernel.create_thread(emuenv.mem, module_name, module_stop, priority, affinity, stack_size, nullptr);
+ 
+         const uint32_t ret = module_thread->run_guest_function(module_stop.address(), args, argp.cast<void>());
+-        module_thread->exit_delete(false);
++        module_thread->remove();
+ 
+         LOG_INFO("Module {} (at \"{}\") module_stop returned {}", module_name, module.path, log_hex(ret));
+         if (ret != SCE_KERNEL_STOP_SUCCESS)
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,14 @@
+diff --git a/vita3k/game-frontend/frontend.cpp b/vita3k/game-frontend/frontend.cpp
+index cdde978..b37544e 100644
+--- a/vita3k/game-frontend/frontend.cpp
++++ b/vita3k/game-frontend/frontend.cpp
+@@ -318,6 +318,9 @@ int run(Profile &profile, int argc, char *argv[]) {
+     cfg.high_accuracy = settings.high_accuracy;
+     cfg.disable_surface_sync = settings.surface_sync == 3;
+     cfg.memory_mapping = "double-buffer";
++    // VITA3K_MEMORY_MAPPING=disabled|double-buffer|page-table|native-buffer: another mapping method (debugging aid)
++    if (const char *mapping = std::getenv("VITA3K_MEMORY_MAPPING"))
++        cfg.memory_mapping = mapping;
+     // a pipeline seen for the first time is compiled in the background (its draws are skipped
+     // meanwhile) and kept in the pipeline cache next to the executable; no on-screen notice
+     cfg.async_pipeline_compilation = true;

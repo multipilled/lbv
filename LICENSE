@@ -1,0 +1,8 @@
+LBV is licensed as follows.
+
+- Patches on Vita3K (third_party/patches/vita3k/) are GPL-2.0, the licence of Vita3K.
+- Patches on vita-recomp-kit (third_party/patches/recomp/) are MIT, the licence of the kit.
+- Everything else is GPL-2.0-or-later.
+
+The full GPL-2.0 text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+The MIT licence text: https://opensource.org/license/mit

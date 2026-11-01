@@ -1,0 +1,55 @@
+From 82a25e7cbce730098a1cc58bafa2c537b76ea1e1 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 8 Oct 2026 20:57:40 +0900
+Subject: [PATCH 12/52] kernel: only write the simple event result pattern when
+ the wait succeeds
+
+A poll that fails and a wait that ends with an error leave pResultPattern unchanged.
+
+(cherry picked from commit 29186aea2ae63ff99f4ee5c6a4ea7629ea464aca)
+---
+ vita3k/kernel/src/sync_primitives.cpp | 17 ++++++-----------
+ 1 file changed, 6 insertions(+), 11 deletions(-)
+
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 4c244425..9e579f21 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -49,12 +49,12 @@ void SimpleEvent::on_delete() {
+ }
+ 
+ SceInt32 SimpleEvent::try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
+-    if (result_pattern)
+-        *result_pattern = pattern;
+-
+     if (!(pattern & wait_pattern))
+         return SCE_KERNEL_ERROR_EVENT_COND;
+ 
++    if (result_pattern)
++        *result_pattern = pattern;
++
+     if (auto_reset)
+         // all common bits are zeroed
+         pattern &= ~wait_pattern;
+@@ -77,14 +77,9 @@ SceInt32 SimpleEvent::wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern,
+     const WaitResult r = waiters.wait(guard, thread, { SCE_KERNEL_WAITTYPE_EVENT, uid }, { wait_pattern, result_pattern, user_data }, deadline, callbacks);
+     writeback_timeout(timeout, deadline);
+     const SceInt32 err = guest_result(r);
+-    if (err < 0) {
+-        // set it only if a timeout occurs
+-        // otherwise set in set_or_pulse
+-        if (user_data)
+-            *user_data = last_user_data;
+-        if (result_pattern)
+-            *result_pattern = pattern;
+-    }
++    // The result pattern is only written when the wait succeeds, by set_or_pulse
++    if (err < 0 && user_data)
++        *user_data = last_user_data;
+     return err;
+ }
+ 
+-- 
+2.54.0.windows.1
+

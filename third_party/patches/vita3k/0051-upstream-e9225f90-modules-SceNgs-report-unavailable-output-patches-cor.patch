@@ -1,0 +1,62 @@
+From 8b87c6ec1be18d368d117cb02ef13237f5055cfd Mon Sep 17 00:00:00 2001
+From: Zangetsu38 <dante38@free.fr>
+Date: Thu, 22 Oct 2026 10:13:12 +0200
+Subject: [PATCH 51/52] modules/SceNgs: report unavailable output patches
+ correctly. - `sceNgsVoiceGetOutputPatch` checks a non-null stored patch
+ handle before resolving it, preventing dereferencing an invalid emulated
+ address. - It returns `SCE_NGS_ERROR_INVALID_HANDLE` when a non-null handle
+ is not valid. - It returns `SCE_NGS_ERROR_PATCH_NOT_AVAIL` when the output
+ slot is empty or its patch is disconnected, instead of reporting success. The
+ caller can then take its route-creation path. - Consolidate the empty-slot
+ and disconnected-patch checks; clear the output handle only when an existing
+ Patch object is disconnected, while empty slots remain null.
+
+Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
+(cherry picked from commit e9225f90f04cdf0d6d7c6fe617c0c70a5a0af84a)
+---
+ vita3k/modules/SceNgsUser/SceNgs.cpp | 20 ++++++++++++++++----
+ 1 file changed, 16 insertions(+), 4 deletions(-)
+
+diff --git a/vita3k/modules/SceNgsUser/SceNgs.cpp b/vita3k/modules/SceNgsUser/SceNgs.cpp
+index 35451a87..e55c4866 100644
+--- a/vita3k/modules/SceNgsUser/SceNgs.cpp
++++ b/vita3k/modules/SceNgsUser/SceNgs.cpp
+@@ -100,6 +100,7 @@ enum SceNgsErrorCode : uint32_t {
+     SCE_NGS_ERROR_INVALID_STATE = 0x804A0010,
+     SCE_NGS_ERROR_PARAM_OUT_OF_RANGE = 0x804A0009,
+     SCE_NGS_ERROR_INVALID_HANDLE = 0x804A000C,
++    SCE_NGS_ERROR_PATCH_NOT_AVAIL = 0x804A000E,
+     SCE_NGS_SIZE_MISMATCH = 0x804A000D
+ };
+ 
+@@ -786,12 +787,23 @@ EXPORT(SceInt32, sceNgsVoiceGetOutputPatch, ngs::Voice *voice, const SceInt32 ou
+     }
+ 
+     *patch = voice->patches[output_index][output_subindex];
+-    if (!(*patch) || (patch->get(emuenv.mem))->output_sub_index == -1) {
+-        LOG_WARN_ONCE("Getting non-existen output patch port {}:{}", output_index, output_subindex);
+-        *patch = Ptr<ngs::Patch>(0);
++    ngs::Patch *output_patch = nullptr;
++    if (*patch) {
++        if (!patch->valid(emuenv.mem)) {
++            return RET_ERROR(SCE_NGS_ERROR_INVALID_HANDLE);
++        }
++
++        output_patch = patch->get(emuenv.mem);
+     }
+ 
+-    return 0;
++    if (!output_patch || (output_patch->output_sub_index == -1)) {
++        if (output_patch)
++            *patch = Ptr<ngs::Patch>(0);
++
++        return RET_ERROR(SCE_NGS_ERROR_PATCH_NOT_AVAIL);
++    }
++
++    return SCE_NGS_OK;
+ }
+ 
+ EXPORT(int, sceNgsVoiceGetParamsOutOfRange) {
+-- 
+2.54.0.windows.1
+

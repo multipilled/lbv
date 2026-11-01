@@ -1,0 +1,10 @@
+# Never tracked: decrypted game files, ELFs, recompiled code, firmware, licences, caches, build output
+gamedata/
+generated/
+build/
+dist/
+third_party/*/build/
+__pycache__/
+.venv/
+.locks/
+*.log

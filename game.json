@@ -1,0 +1,19 @@
+{
+  "_comment": "Read by third_party/recomp/tools (install-game.py, make-dist.py; see gameproject.py). Modelled on vita-recomps/ss-delta. The port targets the last update, 01.22 (installed with the 1.00 dump). libult ships in sce_module/ but LBP did not load it in a 60 s --dump-elfs run (nor in the baseline log), so it is not listed (UNVERIFIED.md). The firmware modules LBP runs as guest code (sysmodule, libSceFt2, libpvf, libscemp4) are recompiled too, as fw_<name> like ss-delta's, so the game runs with the JIT off (M2). All modules are recompiled at their load addresses (the --dump-elfs dumps).",
+  "id": "lbv",
+  "name": "LittleBigPlanet",
+  "title_id": "PCSA00549",
+  "eboot_sha256": {
+    "0d835a2e025ba941fed085c7d16bfe90bc6560dc37864080d308bdb36451c51a": "1.22"
+  },
+  "modules": {
+    "eboot": "eboot",
+    "libc": "libc",
+    "libfios2": "libfios2",
+    "sysmodule": "fw_sysmodule",
+    "libSceFt2": "fw_libSceFt2",
+    "libpvf": "fw_libpvf",
+    "libscemp4": "fw_libscemp4"
+  },
+  "dump_seconds": 60
+}

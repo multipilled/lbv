@@ -1,0 +1,31 @@
+From 716c997e00e3d9b613a4dc7301eb7086e3c6f6f5 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 8 Oct 2026 21:19:05 +0900
+Subject: [PATCH 13/52] kernel: clear the pulsed bits of a simple event
+
+sceKernelPulseEvent clears every bit it pulsed, including ones that were already set.
+
+(cherry picked from commit 0a4b5f026832ca678804f0098ac5afd5a31a5919)
+---
+ vita3k/kernel/src/sync_primitives.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 9e579f21..170b7f09 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -121,8 +121,9 @@ SceInt32 SimpleEvent::set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, b
+         return true;
+     });
+ 
++    // A pulse clears its own bits, the others go back to what they were
+     if (!is_set) {
+-        pattern = old_pattern;
++        pattern = old_pattern & ~set_pattern;
+         last_user_data = old_user_data;
+     }
+ 
+-- 
+2.54.0.windows.1
+

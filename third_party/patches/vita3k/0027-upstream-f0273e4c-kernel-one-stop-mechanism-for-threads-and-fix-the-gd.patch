@@ -1,0 +1,849 @@
+From 88f99a24d4aef85a4880347827442a444443115a Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Fri, 16 Oct 2026 12:32:57 +0900
+Subject: [PATCH 27/52] kernel: one stop mechanism for threads, and fix the gdb
+ stub (#4255)
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the latest VitaAutotests commit, which adds three
+tests:
+- suspend_for_vm_edges checks what a ForVM suspend and resume do in the
+  cases thread_status_matrix leaves out, like nested suspends, callbacks,
+  and waits that end while the thread is suspended. It fails, since
+  Vita3K lets a dormant thread be suspended and a resume with no suspend
+  return 0.
+- cache_mount checks the cache0: device of sceAppUtilCacheMount. It
+  fails on the mount's init and argument checks, and on what cache0:
+  does before a mount.
+- system_font_blocks opens the system font memory blocks by name, which
+  crashes Vita3K.
+
+* kernel: refuse a ForVM suspend of a dormant thread and a resume with no suspend
+
+On a Vita, sceKernelSuspendThreadForVM fails with DORMANT for a thread
+that isn't started, and sceKernelResumeThreadForVM fails with 0x80028033
+for a thread no ForVM suspend holds (suspend_for_vm_edges). Vita3K took
+both: the suspend counted a hold the thread then started under, and the
+resume returned 0. suspend_for_vm_edges passes.
+
+* kernel: stop a thread through holds and one gate
+
+Three things stop a thread from running guest code: the emulator pause,
+the debugger, and ForVM suspends. Each had its own flags, seven in all,
+with rules about which one set the SUSPENDED status, and the ForVM and
+pause cases also had their own waits inside wait(). They're now one set
+of holds, a pause, a debugger and a ForVM count, and one gate in the run
+loop right before guest code runs. A thread anything holds stops there,
+remembering whether it stopped in its own code or on its way back from a
+kernel call, and goes on once nothing holds it. The debugger's and the
+ForVM holds show the thread as SUSPENDED, while a pause alone leaves the
+status as it was, so a guest can't see the pause.
+
+A wait ends as usual while a hold is on, and the gate then stops the
+thread before it returns to its code or runs its callbacks, which is what
+a Vita does. The debugger's first stop, steps and breakpoints set the
+debugger hold, and the kernel no longer keeps the statuses it paused
+threads with. Every autotest whose output doesn't change from run to run
+prints what it printed before, also with the emulator paused for 1 ms
+every 5 ms throughout the suite.
+
+* gdbstub: fix breakpoints, steps and stop replies
+
+The stub stopped at the first thread and read its registers, but little
+worked after that:
+- A breakpoint on a 32-bit Thumb instruction, gdb's kind 3, got an ARM
+  BKPT and the guest crashed. It gets the 16-bit Thumb BKPT now.
+- A step only acted on the thread of the last breakpoint. Before any
+  breakpoint it did nothing and left no current thread, and after one it
+  deadlocked on the thread's mutex. A step now runs the thread its vCont
+  action names.
+- The stop reply didn't name the thread, so gdb took the first one and
+  stepped it after another thread's breakpoint. It's now T05 with the
+  thread.
+- The waits for a thread used the kernel mutex, not the thread's, so they
+  could miss a wakeup. A resumed thread also showed SUSPENDED until it
+  ran, which looked like a new stop. The waits now use the thread's mutex
+  and `stopped_for_debugger()`, which holds only once the thread stops
+  again.
+- Stopping the world also holds the threads inside kernel calls, which
+  stop when their call returns.
+- The listening socket sets SO_REUSEADDR, since a session started within
+  a minute of the last one couldn't bind the port, and the server's start
+  failures are logged as errors.
+
+Checked with gdb 18 on autotests: a breakpoint, steps from the first stop
+and from a breakpoint, and six stops in worker threads, each run ending
+with the output it has without gdb.
+
+* gdbstub: stop new threads, refuse a held step, and reply at once
+
+- A thread created while the debugger had the world stopped could run,
+  since the stop only suspended the threads there already were. The
+  kernel now keeps a debugger stop that new threads start under, like
+  the pause, and it replaces the first thread's wait for the debugger.
+- A step of a thread a pause or a ForVM suspend holds was queued and ran
+  once that hold ended, while gdb believed the thread stopped. The stub
+  now refuses it with an error, which gdb takes as a stop.
+- Each reply waited for the ack of the '+' sent before it, about 40 ms
+  a packet, so a few steps kept the guest stopped for seconds and its
+  timeouts passed. The client socket sets TCP_NODELAY.
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the latest VitaAutotests commit, which adds
+suspend_for_vm_notify. It checks a callback notified while a ForVM
+suspend holds its thread. It fails, since Vita3K sets the callback up
+before the resume, so the thread's context shows the callback's pc.
+
+(cherry picked from commit f0273e4cd9b860ea77c44c73d9f5c5b1ed5fa8ab)
+---
+ vita3k/gdbstub/include/gdbstub/state.h        |   2 -
+ vita3k/gdbstub/src/gdb.cpp                    | 157 +++++++++---------
+ vita3k/interface.cpp                          |   3 +-
+ vita3k/kernel/include/kernel/debugger.h       |   1 -
+ vita3k/kernel/include/kernel/state.h          |   5 +-
+ .../include/kernel/thread/thread_state.h      |  66 +++++---
+ vita3k/kernel/src/kernel.cpp                  |  34 ++--
+ vita3k/kernel/src/thread.cpp                  | 156 ++++++++---------
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       |   6 +-
+ 9 files changed, 220 insertions(+), 210 deletions(-)
+
+diff --git a/vita3k/gdbstub/include/gdbstub/state.h b/vita3k/gdbstub/include/gdbstub/state.h
+index 337727ea..a359b7d7 100644
+--- a/vita3k/gdbstub/include/gdbstub/state.h
++++ b/vita3k/gdbstub/include/gdbstub/state.h
+@@ -48,7 +48,5 @@ struct GDBState {
+     std::string last_reply = "";
+     int thread_info_index = 0;
+ 
+-    SceUID inferior_thread = 0;
+-
+     SceUID current_thread = 0;
+ };
+diff --git a/vita3k/gdbstub/src/gdb.cpp b/vita3k/gdbstub/src/gdb.cpp
+index 67bfed91..80a7fd0a 100644
+--- a/vita3k/gdbstub/src/gdb.cpp
++++ b/vita3k/gdbstub/src/gdb.cpp
+@@ -416,6 +416,19 @@ static std::string cmd_write_binary(EmuEnvState &state, PacketCommand &command)
+ 
+ static std::string cmd_detach(EmuEnvState &state, PacketCommand &command) { return "OK"; }
+ 
++// The stop reply for a thread that stopped on a trap
++static std::string stop_reply(SceUID thread_id) {
++    return "T05thread:" + to_hex(thread_id) + ";";
++}
++
++static std::vector<ThreadStatePtr> list_threads(EmuEnvState &state) {
++    const auto guard = std::lock_guard(state.kernel.mutex);
++    std::vector<ThreadStatePtr> threads;
++    for (const auto &[_, thread] : state.kernel.threads)
++        threads.push_back(thread);
++    return threads;
++}
++
+ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+     const std::string content = content_string(command);
+     constexpr auto watch_delay = std::chrono::milliseconds(100);
+@@ -428,86 +441,65 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+ 
+         const char cmd = text[0];
+         switch (cmd) {
+-        case 'c':
+-        case 'C':
+         case 's':
+         case 'S': {
+-            bool step = cmd == 's' || cmd == 'S';
+-
+-            // inferior_thread is the thread that triggered breakpoint before
+-            // step or run that thread
+-
+-            if (state.gdb.inferior_thread != 0) {
+-                const auto guard = std::lock_guard(state.kernel.mutex);
+-                auto thread = state.kernel.threads[state.gdb.inferior_thread];
+-                auto thread_lock = std::unique_lock(thread->mutex);
+-                thread->resume(step);
+-                if (step) {
+-                    // Wait until it finish stepping
+-                    // TODO if that thread waits for sync primitive, dead lock.
+-                    thread->status_cond.wait(thread_lock, [&]() { return thread->status == ThreadStatus::suspended; });
+-                }
+-            }
+-
+-            if (!step) {
+-                // resume the world
+-                {
+-                    auto lock = std::unique_lock(state.kernel.mutex);
+-                    for (const auto &pair : state.kernel.threads) {
+-                        auto &thread = pair.second;
+-                        if (thread->status == ThreadStatus::suspended) {
+-                            lock.unlock();
+-                            // A thread a ForVM suspend holds stays suspended
+-                            const bool runs = thread->resume();
+-                            lock.lock();
+-
+-                            if (runs)
+-                                thread->status_cond.wait(lock, [&]() { return thread->status != ThreadStatus::suspended; });
+-                        }
++            // The action names the thread to step, else it's the current one
++            const size_t colon = text.find(':');
++            SceUID thread_id = colon == std::string::npos ? 0 : static_cast<SceUID>(parse_hex(text.substr(colon + 1)));
++            if (thread_id <= 0)
++                thread_id = state.gdb.current_thread;
++            const ThreadStatePtr thread = state.kernel.get_thread(thread_id);
++            if (!thread)
++                return "E00";
++
++            // A thread something else holds can't step, and gdb takes the error as a stop
++            if (!thread->resume(true))
++                return "E01";
++            // TODO: a step into a call that waits on a thread the debugger holds never returns
++            auto lock = std::unique_lock(thread->mutex);
++            thread->status_cond.wait(lock, [&]() { return thread->stopped_for_debugger() || thread->status == ThreadStatus::dormant || thread->status == ThreadStatus::deleted; });
++
++            state.gdb.current_thread = thread_id;
++            return stop_reply(thread_id);
++        }
++        case 'c':
++        case 'C': {
++            // Resume the world. A thread something else holds stays stopped.
++            state.kernel.resume_suspended_threads();
++
++            // Wait until some thread hits a breakpoint
++            ThreadStatePtr stopped;
++            while (!stopped) {
++                auto lock = std::unique_lock(state.kernel.mutex);
++
++                if (state.gdb.server_die)
++                    return "";
++                for (const auto &[_, thread] : state.kernel.threads) {
++                    const auto thread_guard = std::lock_guard(thread->mutex);
++                    if (thread->stopped_for_debugger() && hit_breakpoint(*thread->cpu)) {
++                        stopped = thread;
++                        break;
+                     }
+                 }
+-                // wait until some threads trigger breakpoint
+-                bool did_break = false;
+-                while (!did_break) {
+-                    auto lock = std::unique_lock(state.kernel.mutex);
+-
+-                    if (state.gdb.server_die)
+-                        return "";
+-                    for (const auto &[id, thread] : state.kernel.threads) {
+-                        const auto thread_guard = std::lock_guard(thread->mutex);
+-                        if (thread->status == ThreadStatus::suspended && hit_breakpoint(*thread->cpu)) {
+-                            state.gdb.inferior_thread = id;
+-                            did_break = true;
+-                            break;
+-                        }
+-                    }
+ 
+-                    lock.unlock();
++                lock.unlock();
+ 
+-                    std::this_thread::sleep_for(std::chrono::milliseconds(watch_delay));
+-                }
++                std::this_thread::sleep_for(std::chrono::milliseconds(watch_delay));
++            }
+ 
+-                auto thread = state.kernel.get_thread(state.gdb.inferior_thread);
+-                LOG_INFO("GDB Breakpoint trigger (thread name: {}, thread_id: {})", thread->name, thread->id);
+-                LOG_INFO("PC: {} LR: {}", read_pc(*thread->cpu), read_lr(*thread->cpu));
+-                LOG_INFO("{}", thread->log_stack_traceback());
+-
+-                // stop the world
+-                {
+-                    auto lock = std::unique_lock(state.kernel.mutex);
+-                    for (const auto &pair : state.kernel.threads) {
+-                        auto thread = pair.second;
+-                        if (thread->status == ThreadStatus::running) {
+-                            thread->suspend();
+-                            // A thread that ends meanwhile stops as dormant, or as deleted if it deletes itself
+-                            thread->status_cond.wait(lock, [=]() { return thread->status == ThreadStatus::suspended || thread->status == ThreadStatus::dormant || thread->status == ThreadStatus::deleted; });
+-                        }
+-                    }
+-                }
++            LOG_INFO("GDB Breakpoint trigger (thread name: {}, thread_id: {})", stopped->name, stopped->id);
++            LOG_INFO("PC: {} LR: {}", read_pc(*stopped->cpu), read_lr(*stopped->cpu));
++            LOG_INFO("{}", stopped->log_stack_traceback());
++
++            // Stop the world. A thread inside a kernel call stops when the call returns.
++            state.kernel.suspend_threads();
++            for (const ThreadStatePtr &thread : list_threads(state)) {
++                auto lock = std::unique_lock(thread->mutex);
++                thread->status_cond.wait(lock, [&]() { return thread->status != ThreadStatus::running; });
+             }
+ 
+-            state.gdb.current_thread = state.gdb.inferior_thread;
+-            return "S05";
++            state.gdb.current_thread = stopped->id;
++            return stop_reply(stopped->id);
+         }
+         default:
+             LOG_GDB("Unsupported vCont command '{}'", cmd);
+@@ -587,9 +579,10 @@ static std::string cmd_add_breakpoint(EmuEnvState &state, PacketCommand &command
+ 
+     LOG_GDB("GDB Server New Breakpoint at {} ({}, {}).", log_hex(address), type, kind);
+ 
+-    // kind is 2 if it's thumb mode
++    // kind is 2 for a 16-bit Thumb instruction, 3 for a 32-bit one and 4 for ARM. A 16-bit BKPT
++    // over the first halfword stops at a 32-bit Thumb instruction too.
+     // https://sourceware.org/gdb/current/onlinedocs/gdb/ARM-Breakpoint-Kinds.html#ARM-Breakpoint-Kinds
+-    state.kernel.debugger.add_breakpoint(state.mem, address, kind == 2);
++    state.kernel.debugger.add_breakpoint(state.mem, address, kind == 2 || kind == 3);
+ 
+     return "OK";
+ }
+@@ -768,6 +761,10 @@ static void server_listen(EmuEnvState &state) {
+ 
+     LOG_INFO("GDB Server Received Connection");
+ 
++    // A reply goes out at once, without waiting for the ack of the '+' sent before it
++    const int nodelay = 1;
++    setsockopt(state.gdb.client_socket, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
++
+     int64_t status;
+ 
+     do {
+@@ -783,17 +780,23 @@ void server_open(EmuEnvState &state) {
+ #ifdef _WIN32
+     int32_t err = WSAStartup(MAKEWORD(2, 2), &state.gdb.wsaData);
+     if (err) {
+-        LOG_GDB("GDB Server Failed: Could not start WSA service.");
++        LOG_ERROR("GDB Server Failed: Could not start WSA service.");
+         return;
+     }
+ #endif
+ 
+     state.gdb.listen_socket = socket(AF_INET, SOCK_STREAM, 0);
+     if (state.gdb.listen_socket == -1) {
+-        LOG_GDB("GDB Server Failed: Could not create socket.");
++        LOG_ERROR("GDB Server Failed: Could not create socket.");
+         return;
+     }
+ 
++#ifndef _WIN32
++    // An earlier session's connection keeps the port in TIME_WAIT for a while after it ends
++    const int reuse = 1;
++    setsockopt(state.gdb.listen_socket, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
++#endif
++
+     sockaddr_in socket_address{};
+     socket_address.sin_family = AF_INET;
+     socket_address.sin_port = htons(GDB_SERVER_PORT);
+@@ -804,12 +807,12 @@ void server_open(EmuEnvState &state) {
+ #endif
+ 
+     if (bind(state.gdb.listen_socket, (sockaddr *)&socket_address, sizeof(socket_address)) == -1) {
+-        LOG_GDB("GDB Server Failed: Could not bind socket.");
++        LOG_ERROR("GDB Server Failed: Could not bind socket.");
+         return;
+     }
+ 
+     if (listen(state.gdb.listen_socket, 1) == -1) {
+-        LOG_GDB("GDB Server Failed: Could not listen on socket.");
++        LOG_ERROR("GDB Server Failed: Could not listen on socket.");
+         return;
+     }
+ 
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 25e0d7b2..01f06052 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -673,7 +673,8 @@ ExitCode load_app(int32_t &main_module_id, EmuEnvState &emuenv, const AppLaunchR
+     }
+ 
+     if (emuenv.cfg.gdbstub) {
+-        emuenv.kernel.debugger.wait_for_debugger = true;
++        // The threads wait for the debugger's first continue
++        emuenv.kernel.suspend_threads();
+         server_open(emuenv);
+     }
+ 
+diff --git a/vita3k/kernel/include/kernel/debugger.h b/vita3k/kernel/include/kernel/debugger.h
+index fa5953e9..0f533da7 100644
+--- a/vita3k/kernel/include/kernel/debugger.h
++++ b/vita3k/kernel/include/kernel/debugger.h
+@@ -41,7 +41,6 @@ struct Debugger {
+     Debugger() = delete;
+     explicit Debugger(KernelState &kernel);
+ 
+-    bool wait_for_debugger = false;
+     bool watch_import_calls = false;
+     bool watch_code = false;
+     bool watch_memory = false;
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index 7790d484..fc7d2187 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -192,6 +192,9 @@ struct KernelState {
+     }
+     void pause_threads();
+     void resume_threads();
++    // Stops every thread for the debugger, and the threads created until the resume start stopped
++    void suspend_threads();
++    void resume_suspended_threads();
+ 
+     // Kill all guest threads and block until they have exited. Must only be called from a host thread.
+     void process_exit();
+@@ -206,6 +209,6 @@ struct KernelState {
+ 
+ private:
+     std::atomic<SceUID> next_uid{ 1 };
+-    std::map<SceUID, ThreadStatus> paused_threads_status;
+     bool threads_paused = false;
++    bool threads_suspended = false;
+ };
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index aa48d571..6e5c2bc1 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -145,23 +145,28 @@ struct ThreadState {
+     // Whether a callback of this thread was notified and hasn't run yet. Called with mutex held.
+     bool callbacks_notified() const { return notified_callbacks > 0; }
+ 
++    // Stops the thread for the debugger, the next time it would run guest code
+     void suspend();
+-    // Resumes a thread the debugger suspended. Returns whether it runs again, which it doesn't while
+-    // a ForVM suspend holds it.
++    // Lets a thread the debugger stopped run again, for one instruction with step. Returns whether it
++    // runs, which it doesn't while something else holds it. A step then doesn't happen at all.
+     bool resume(bool step = false);
+-    // Pause/resume the emulator without changing a thread's wait state.
+-    ThreadStatus pause();
+-    void resume_from_pause(ThreadStatus previous_status);
++    // Whether the thread has stopped for the debugger, where suspend() stops it. Called with mutex held.
++    bool stopped_for_debugger() const { return holds.debugger && status == ThreadStatus::suspended; }
++    // Stops the thread while the emulator is paused, and lets it run again after
++    void pause();
++    void resume_from_pause();
+     // Suspends the thread for sceKernelSuspendThreadForVM: it doesn't run guest code until as many
+-    // vm_resume calls. vm_suspend returns once it has stopped. Each returns the suspend count after it.
++    // vm_resume calls. vm_suspend returns once it has stopped. Each returns the suspend count after
++    // it, or an error for a dormant thread or a resume with no suspend.
+     int vm_suspend();
+     int vm_resume();
+     // Whether vm_suspend holds the thread. Called with mutex held.
+-    bool vm_suspended() const { return vm_suspend_count > 0; }
++    bool vm_suspended() const { return holds.vm > 0; }
+     // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
+     void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
+-    // Whether the thread is inside a wait call, also one that ended while vm_suspend held it. Called with mutex held.
+-    bool in_wait() const { return status == ThreadStatus::waiting || vm_held_in_wait; }
++    // Whether the thread is inside a kernel call: waiting, or held on its way back from one. Called
++    // with mutex held.
++    bool in_wait() const { return status == ThreadStatus::waiting || (status == ThreadStatus::suspended && stop_point == StopPoint::syscall); }
+     std::string log_stack_traceback() const;
+ 
+ private:
+@@ -176,8 +181,33 @@ private:
+         remove,
+     };
+ 
++    // What keeps the thread from running guest code. It runs only while nothing holds it.
++    struct Holds {
++        // The emulator is paused
++        bool pause = false;
++        // The debugger stopped it, or it hit a breakpoint or finished a step
++        bool debugger = false;
++        // The sceKernelSuspendThreadForVM calls no sceKernelResumeThreadForVM undid yet
++        int vm = 0;
++
++        bool any() const { return pause || debugger || vm > 0; }
++        // Whether the guest sees the thread as SUSPENDED. A pause alone doesn't show.
++        bool shown() const { return debugger || vm > 0; }
++    };
++
++    // Where a held thread stopped
++    enum class StopPoint : uint8_t {
++        // In its own code
++        guest_code,
++        // On its way back from a call into the kernel
++        syscall,
++    };
++
+     // Whether the thread is ending. Called with mutex held.
+     bool exiting() const { return ending != Ending::none; }
++    // Keeps the thread from going on into guest code while anything holds it, unless it's ending.
++    // Called with mutex held through lock.
++    void wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint where);
+     // Asks the thread to end, keeping a stronger request already made. Called with mutex held.
+     void request_ending(Ending how) { ending = std::max(ending, how); }
+ 
+@@ -188,15 +218,11 @@ private:
+ 
+     CPUContext init_cpu_ctx;
+     Ending ending = Ending::none;
+-    // Set by suspend(), consumed in run_loop() to transition to ThreadStatus::suspended.
+-    bool suspend_requested = false;
+-    // Set while suspend(), a step or a breakpoint holds the thread suspended, until resume().
+-    bool debugger_suspended = false;
+-    // Emulator pause is separate from a guest wait or debugger suspension.
+-    bool pause_requested = false;
+-    bool pause_suspended = false;
+-    // Single stepping mode.
+-    bool single_stepping = false;
++    Holds holds;
++    // The debugger asked for one instruction, after which the thread holds again
++    bool step_requested = false;
++    // Where the thread stopped the last time something held it
++    StopPoint stop_point = StopPoint::guest_code;
+ 
+     // when calling sceKernelStartThread
+     bool run_start_callback = false;
+@@ -209,10 +235,6 @@ private:
+     bool wake_pending = false;
+     // Callbacks of this thread with notifications they haven't run for.
+     SceUInt32 notified_callbacks = 0;
+-    // The vm_suspend calls that no vm_resume undid yet.
+-    int vm_suspend_count = 0;
+-    // Set while vm_suspend holds the thread in a wait call that already ended.
+-    bool vm_held_in_wait = false;
+     // Set while the thread runs its callbacks. They don't nest.
+     bool is_processing_callbacks = false;
+     // Callbacks this thread created, in creation order. The kernel owns them. Only this thread touches the list.
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index 3268736d..f0407c26 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -189,7 +189,9 @@ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<c
+         const std::lock_guard<std::mutex> lock(mutex);
+         threads.emplace(thread->id, thread);
+         if (threads_paused)
+-            paused_threads_status[thread->id] = thread->pause();
++            thread->pause();
++        if (threads_suspended)
++            thread->suspend();
+     }
+ 
+     ThreadParams params;
+@@ -243,27 +245,34 @@ void KernelState::process_exit() {
+ 
+ void KernelState::pause_threads() {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    // Already paused: keep the statuses recorded by the first call, they are needed to resume.
+     if (threads_paused)
+         return;
+     threads_paused = true;
+-    paused_threads_status.clear();
+-    for (auto &[_, thread] : threads) {
+-        paused_threads_status[thread->id] = thread->pause();
+-    }
++    for (auto &[_, thread] : threads)
++        thread->pause();
+ }
+ 
+ void KernelState::resume_threads() {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    for (auto &[_, thread] : threads) {
+-        const auto previous = paused_threads_status.find(thread->id);
+-        if (previous != paused_threads_status.end())
+-            thread->resume_from_pause(previous->second);
+-    }
+-    paused_threads_status.clear();
++    for (auto &[_, thread] : threads)
++        thread->resume_from_pause();
+     threads_paused = false;
+ }
+ 
++void KernelState::suspend_threads() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    threads_suspended = true;
++    for (auto &[_, thread] : threads)
++        thread->suspend();
++}
++
++void KernelState::resume_suspended_threads() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    threads_suspended = false;
++    for (auto &[_, thread] : threads)
++        thread->resume();
++}
++
+ void KernelState::deinit(MemState &mem) {
+     process_exit();
+     threads.clear();
+@@ -315,7 +324,6 @@ void KernelState::deinit(MemState &mem) {
+ 
+     next_uid = 1;
+ 
+-    paused_threads_status.clear();
+     threads_paused = false;
+ }
+ 
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index b565634c..43e14779 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -140,12 +140,7 @@ int ThreadState::start(SceSize arglen, const Ptr<void> argp, bool run_entry_call
+         write_reg(*cpu, 1, 0);
+     }
+ 
+-    if (kernel.debugger.wait_for_debugger) {
+-        kernel.debugger.wait_for_debugger = false;
+-        status = ThreadStatus::suspended;
+-    } else {
+-        status = ThreadStatus::running;
+-    }
++    status = ThreadStatus::running;
+     status_cond.notify_one();
+ 
+     return SCE_KERNEL_OK;
+@@ -174,7 +169,7 @@ void ThreadState::remove() {
+     if (status == ThreadStatus::running)
+         stop(*cpu);
+ 
+-    // run_loop() may be parked on status_cond while pause_requested is true, even if status is running.
++    // run_loop() may wait on status_cond, parked dormant or held at its gate
+     status_cond.notify_all();
+ 
+     // Wake if blocked in a wait
+@@ -266,10 +261,8 @@ void ThreadState::run_loop(bool top_level) {
+         }
+ 
+         // Park until we have something to do.
+-        if (status != ThreadStatus::running || pause_requested) {
+-            status_cond.wait(lock, [&] {
+-                return (status == ThreadStatus::running && !pause_requested) || exiting();
+-            });
++        if (status != ThreadStatus::running) {
++            status_cond.wait(lock, [&] { return status == ThreadStatus::running || exiting(); });
+             continue;
+         }
+ 
+@@ -286,11 +279,14 @@ void ThreadState::run_loop(bool top_level) {
+             lock.lock();
+         }
+ 
+-        // Active JIT loop. Lock held on entry and exit; unlocked only around run/step.
++        // Active JIT loop. Lock held on entry and exit; unlocked only around run/step. A nested
++        // level runs a callback or handler from inside a kernel call.
++        StopPoint last_stop = top_level ? StopPoint::guest_code : StopPoint::syscall;
+         while (!exiting() && !guest_returned && status == ThreadStatus::running) {
+-            const bool do_step = single_stepping;
+-            if (do_step)
+-                single_stepping = false;
++            wait_while_held(lock, last_stop);
++            if (exiting())
++                break;
++            const bool do_step = std::exchange(step_requested, false);
+ 
+             lock.unlock();
+ 
+@@ -298,7 +294,8 @@ void ThreadState::run_loop(bool top_level) {
+             const int res = do_step ? step(*cpu) : run(*cpu);
+ 
+             // handle svc call if this was what stopped the cpu
+-            if (cpu->svc_called) {
++            const bool syscall = cpu->svc_called;
++            if (syscall) {
+                 const uint32_t nid = *Ptr<uint32_t>(read_pc(*cpu) + 4).get(mem);
+                 kernel.call_import(*cpu, nid, id);
+                 clear_exclusive(*cpu);
+@@ -310,14 +307,10 @@ void ThreadState::run_loop(bool top_level) {
+ 
+             lock.lock();
+ 
+-            if (do_step || suspend_requested || vm_suspended() || hit_breakpoint(*cpu)) {
+-                const bool debugger_stop = do_step || hit_breakpoint(*cpu);
+-                pause_suspended = pause_requested && suspend_requested && !debugger_stop;
+-                // During an emulator pause, suspend_requested is the pause's
+-                debugger_suspended = debugger_stop || (suspend_requested && !pause_requested);
+-                suspend_requested = false;
+-                update_status(ThreadStatus::suspended);
+-            }
++            last_stop = syscall ? StopPoint::syscall : StopPoint::guest_code;
++            // A finished step or a breakpoint holds the thread for the debugger
++            if (do_step || hit_breakpoint(*cpu))
++                holds.debugger = true;
+ 
+             // Guest function for this run_loop returned (or errored).
+             if (res != 0) {
+@@ -334,6 +327,9 @@ void ThreadState::run_loop(bool top_level) {
+     }
+ }
+ 
++// What a ForVM resume returns for a thread no ForVM suspend holds, an error with no public name
++constexpr int VM_NOT_SUSPENDED = static_cast<int>(0x80028033);
++
+ void ThreadState::push_arguments(const std::vector<uint32_t> &args) {
+     Address sp = read_sp(*cpu);
+     for (size_t i = 0; i < std::min(args.size(), static_cast<size_t>(4)); i++) {
+@@ -533,19 +529,7 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+         wait_cv.wait(lock, woken);
+     else
+         satisfied = wait_cv.wait_until(lock, deadline, woken);
+-    // Woken while a ForVM suspend holds it, the thread stays in the call as suspended until the
+-    // resume. One whose timeout passed leaves its queue first and stops in run_loop, so a later
+-    // wake doesn't take the place of the timeout.
+-    if (vm_suspended() && satisfied && !exiting()) {
+-        wait_target = {};
+-        vm_held_in_wait = true;
+-        update_status(ThreadStatus::suspended);
+-        wait_cv.wait(lock, [&] { return !vm_suspended() || exiting(); });
+-        vm_held_in_wait = false;
+-    }
+-    // A wake during emulator pause must not let this guest thread run callbacks
+-    // or return to its JIT loop until the pause has been lifted.
+-    wait_cv.wait(lock, [&] { return !pause_requested || exiting(); });
++    // A thread something holds goes on to its gate, which keeps it from its callbacks and its code
+     update_status(ThreadStatus::running);
+     wait_target = {};
+     if (exiting())
+@@ -626,68 +610,61 @@ Address ThreadState::stack_top() const {
+     return stack.get() + stack_size;
+ }
+ 
+-void ThreadState::suspend() {
+-    bool should_stop = false;
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        if (status == ThreadStatus::running) {
+-            suspend_requested = true;
+-            should_stop = true;
+-        }
++void ThreadState::wait_while_held(std::unique_lock<std::mutex> &lock, StopPoint where) {
++    if (!holds.any() || exiting())
++        return;
++    stop_point = where;
++    // The holds can change while the thread waits, and with them what its status shows
++    while (holds.any() && !exiting()) {
++        const ThreadStatus shown = holds.shown() ? ThreadStatus::suspended : ThreadStatus::running;
++        if (status != shown)
++            update_status(shown);
++        status_cond.wait(lock);
+     }
+-    if (should_stop)
++    if (status != ThreadStatus::running)
++        update_status(ThreadStatus::running);
++}
++
++void ThreadState::suspend() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    holds.debugger = true;
++    if (status == ThreadStatus::running)
+         stop(*cpu);
++    // A thread a pause already holds at its gate shows as suspended now
++    status_cond.notify_all();
+ }
+ 
+ bool ThreadState::resume(bool step) {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    assert(status == ThreadStatus::suspended || status == ThreadStatus::dormant);
+-    single_stepping = step;
+-    suspend_requested = false;
+-    debugger_suspended = false;
+-    // A ForVM suspend outlasts the debugger's
+-    if (vm_suspended())
++    // A step happens now or not at all
++    if (step && (holds.pause || holds.vm > 0))
+         return false;
+-    update_status(ThreadStatus::running);
+-    return true;
++    holds.debugger = false;
++    step_requested = step;
++    status_cond.notify_all();
++    return !holds.any();
+ }
+ 
+-ThreadStatus ThreadState::pause() {
+-    bool should_stop = false;
+-    ThreadStatus previous_status;
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        previous_status = status;
+-        pause_requested = true;
+-        if (status == ThreadStatus::running) {
+-            suspend_requested = true;
+-            should_stop = true;
+-        }
+-    }
+-    if (should_stop)
++void ThreadState::pause() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    holds.pause = true;
++    if (status == ThreadStatus::running)
+         stop(*cpu);
+-    return previous_status;
+ }
+ 
+-void ThreadState::resume_from_pause(ThreadStatus previous_status) {
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        pause_requested = false;
+-        if (previous_status == ThreadStatus::running) {
+-            suspend_requested = false;
+-            // A ForVM suspend made while the thread still ran outlasts the pause
+-            if (pause_suspended && status == ThreadStatus::suspended && !vm_suspended())
+-                update_status(ThreadStatus::running);
+-        }
+-        pause_suspended = false;
+-        status_cond.notify_all();
+-        wait_cv.notify_all();
+-    }
++void ThreadState::resume_from_pause() {
++    const std::lock_guard<std::mutex> lock(mutex);
++    holds.pause = false;
++    status_cond.notify_all();
+ }
+ 
+ int ThreadState::vm_suspend() {
+     std::unique_lock<std::mutex> lock(mutex);
+-    const int count = ++vm_suspend_count;
++    if (status == ThreadStatus::dormant)
++        return SCE_KERNEL_ERROR_DORMANT;
++    const int count = ++holds.vm;
++    // A thread a pause already holds at its gate shows as suspended now
++    status_cond.notify_all();
+     if (status == ThreadStatus::running) {
+         stop(*cpu);
+         // Like on a Vita, return once the thread has stopped, so its context holds still
+@@ -702,14 +679,11 @@ void ThreadState::wait_for_vm_stop(std::unique_lock<std::mutex> &lock) {
+ 
+ int ThreadState::vm_resume() {
+     const std::lock_guard<std::mutex> lock(mutex);
+-    if (vm_suspend_count == 0 || --vm_suspend_count > 0)
+-        return vm_suspend_count;
+-    // A thread held in its wait call marks itself running once it leaves, and a suspend of the
+-    // debugger's outlasts this one
+-    if (status == ThreadStatus::suspended && !vm_held_in_wait && !debugger_suspended)
+-        update_status(ThreadStatus::running);
+-    // A thread held in its wait call waits for this, and so may a suspend that waits for it to stop
+-    wait_cv.notify_all();
++    if (holds.vm == 0)
++        return VM_NOT_SUSPENDED;
++    if (--holds.vm > 0)
++        return holds.vm;
++    // The gate waits for this, and so may a suspend that waits for the thread to stop
+     status_cond.notify_all();
+     return 0;
+ }
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 19ca641e..fd15d963 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -1631,7 +1631,8 @@ EXPORT(int, sceKernelResumeThreadForVM, SceUID threadId) {
+     ThreadStatePtr thread;
+     if (const int error = vm_target(emuenv, thread_id, threadId, thread))
+         return RET_ERROR(error);
+-    return thread->vm_resume();
++    const int count = thread->vm_resume();
++    return count < 0 ? RET_ERROR(count) : count;
+ }
+ 
+ EXPORT(int, sceKernelSendSignal, SceUID target_thread_id) {
+@@ -1729,7 +1730,8 @@ EXPORT(int, sceKernelSuspendThreadForVM, SceUID threadId) {
+     ThreadStatePtr thread;
+     if (const int error = vm_target(emuenv, thread_id, threadId, thread))
+         return RET_ERROR(error);
+-    return thread->vm_suspend();
++    const int count = thread->vm_suspend();
++    return count < 0 ? RET_ERROR(count) : count;
+ }
+ 
+ EXPORT(int, sceKernelTryLockMutex, SceUID mutexid, int lock_count) {
+-- 
+2.54.0.windows.1
+

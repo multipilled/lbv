@@ -1,0 +1,873 @@
+From dec3f210d6630c4862461fdaccbbaa4cc27c2b4e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 15 Oct 2026 11:05:47 +0900
+Subject: [PATCH 24/52] VitaAutotests bump again and more small fixes (#4242)
+
+* kernel: return from a ForVM suspend once the thread has stopped
+
+sceKernelSuspendThreadForVM returned as soon as it asked the thread to
+stop, so a context read right after it could race with the thread still
+running guest code. A thread woken while suspended also went back to
+its code and wrote its result before it stopped. On a Vita the suspend
+only returns once the thread has stopped, and a woken thread reports
+SUSPENDED and stays in its wait call until the resume, with the context
+it had while it waited. Now the suspend waits for the thread to stop,
+and a woken thread stays in its wait call as suspended. A wait whose
+timeout passed while suspended leaves its queue first, so a later wake
+can't take the place of the timeout as it can't on a Vita, and stops on
+its way back to its code, which a context read waits for.
+
+Found in the review of #4240
+(see https://github.com/Vita3K/Vita3K/pull/4240#discussion_r4273124329).
+
+* kernel: keep the ForVM and debugger suspends apart
+
+The ForVM suspend shared suspend_requested with the debugger's, so a
+ForVM resume let go of a thread that the debugger or
+sceKernelWaitExceptionForMono had suspended, and the debugger's resume
+let go of a thread the ForVM count held. Now the ForVM suspend only
+uses its count, and the thread stays suspended while either holds it.
+The debugger's resume returns whether the thread runs again, so the
+gdb stub doesn't wait for a thread the ForVM count still holds.
+
+Found in the review of #4240
+(see https://github.com/Vita3K/Vita3K/pull/4240#discussion_r4273124415).
+
+* ci: run the latest VitaAutotests
+
+Move AUTOTESTS_REF to the latest VitaAutotests commit. It adds
+thread_suspend_for_vm_stops, which checks that a ForVM suspend returns
+once the thread has stopped, a case to thread_context_vfp for a thread
+woken while suspended, a case to thread_status_matrix for a signal
+after a suspended wait timed out, cases to msgpipe_vectors for long
+vector lists, their total size and empty pieces, and
+msgpipe_failed_sizes for the sizes failed message pipe calls write. The
+first two pass, and msgpipe_vectors and msgpipe_failed_sizes still
+fail, since Vita3K doesn't have the vector calls.
+
+* kernel: fail a CB delay of 0 like a Vita
+
+sceKernelDelayThreadCB(0) returned 0 and ran the pending callbacks. On
+a Vita it fails with SCE_KERNEL_ERROR_INVALID_ARGUMENT, like
+sceKernelDelayThread(0), and runs no callbacks.
+
+* kernel: run a CB wait's pending callbacks only once its object is found
+
+Every CB wait ran the pending callbacks first, so a wait on an unknown
+UID ran them before it failed. On a Vita such a wait fails at once and
+runs no callbacks, while one that finds its object runs them even when
+it ends at once or has a timeout of 0. The callbacks now run right
+before the wait, after the lookup and the checks of the export.
+
+* kernel: take a free lightweight mutex without running callbacks
+
+sceKernelLockLwMutexCB ran the pending callbacks even when it took a
+lightweight mutex no other thread held. A Vita takes such a mutex in
+user code, so it runs no callbacks. It now only runs them, and waits,
+when another thread holds the mutex.
+
+* kernel: report a size of 0 when a message pipe wait fails
+
+A message pipe send or receive whose wait timed out, was canceled or
+ended with a delete left its size untouched. On a Vita it writes the
+size it moved, which is 0 here, since Vita3K only moves data once a
+wait ends. A call that fails on its arguments still writes nothing.
+
+* kernel: let a message pipe transfer move a list of pieces
+
+MsgPipe::send and MsgPipe::receive took one host buffer. They now take
+a list of pieces in guest memory and copy each one straight to or from
+the pipe's buffer, so the vector calls won't need to copy their pieces
+into a buffer of their own first. A plain call passes one piece.
+Nothing else changes.
+
+* kernel: implement the message pipe vector calls
+
+sceKernelSendMsgPipeVector, sceKernelReceiveMsgPipeVector, their CB
+forms and their try forms returned an unimplemented error. They now
+check the guest's list of pieces and hand it to the pipe as it is,
+which sends the pieces as one message and receives into them in order.
+A list has no limit on its number of pieces, where a Vita takes at
+least 8192. Like on a Vita, every piece needs a buffer even when it is
+empty, only the size of all the pieces together is checked against the
+pipe, and a list of only empty pieces ends at once in both modes,
+unlike a plain ASAP call of 0 bytes.
+
+(cherry picked from commit 41cac41ade11c639e2b692ee0699c5b8f786744d)
+---
+ vita3k/gdbstub/src/gdb.cpp                    |   6 +-
+ .../kernel/include/kernel/sync_primitives.h   |  13 +-
+ .../include/kernel/thread/thread_state.h      |  16 +-
+ vita3k/kernel/src/sync_primitives.cpp         |  47 +++--
+ vita3k/kernel/src/thread.cpp                  |  68 +++++---
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       |  37 ++--
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  | 162 +++++++++++++-----
+ vita3k/util/include/util/byte_ring_buffer.h   |  21 +--
+ 8 files changed, 261 insertions(+), 109 deletions(-)
+
+diff --git a/vita3k/gdbstub/src/gdb.cpp b/vita3k/gdbstub/src/gdb.cpp
+index 7f49d92d..47e66334 100644
+--- a/vita3k/gdbstub/src/gdb.cpp
++++ b/vita3k/gdbstub/src/gdb.cpp
+@@ -457,10 +457,12 @@ static std::string cmd_continue(EmuEnvState &state, PacketCommand &command) {
+                         auto &thread = pair.second;
+                         if (thread->status == ThreadStatus::suspended) {
+                             lock.unlock();
+-                            thread->resume();
++                            // A thread a ForVM suspend holds stays suspended
++                            const bool runs = thread->resume();
+                             lock.lock();
+ 
+-                            thread->status_cond.wait(lock, [&]() { return thread->status != ThreadStatus::suspended; });
++                            if (runs)
++                                thread->status_cond.wait(lock, [&]() { return thread->status != ThreadStatus::suspended; });
+                         }
+                     }
+                 }
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 220b4e39..7e36acef 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -26,6 +26,7 @@
+ #include <expected>
+ #include <limits>
+ #include <map>
++#include <span>
+ #include <string>
+ #include <variant>
+ 
+@@ -311,6 +312,12 @@ public:
+ 
+ typedef std::shared_ptr<Condvar> CondvarPtr;
+ 
++// One piece of a message pipe transfer, a buffer in guest memory
++struct MsgPipeVector {
++    Ptr<void> base;
++    SceSize size;
++};
++
+ class MsgPipe final : public WithUidClass<SyncPrimitive, UidClass::msg_pipe> {
+ public:
+     MsgPipe(SceUInt32 attr, const char *name, std::size_t buf_size);
+@@ -318,9 +325,9 @@ public:
+     // Returns the error a create with these arguments gets, or SCE_KERNEL_OK
+     static SceInt32 check_create(const char *name, SceUInt32 type, SceUInt32 attr, SceSize buf_size);
+ 
+-    // Both return the size transferred, or the error
+-    std::expected<SceSize, SceInt32> receive(const ThreadStatePtr &thread, SceUInt32 wait_mode, void *buf, SceSize size, SceUInt32 *timeout, bool callbacks);
+-    std::expected<SceSize, SceInt32> send(const ThreadStatePtr &thread, SceUInt32 wait_mode, const void *buf, SceSize size, SceUInt32 *timeout, bool callbacks);
++    // Both move the bytes of the pieces in order, and return the size transferred, or the error
++    std::expected<SceSize, SceInt32> receive(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks);
++    std::expected<SceSize, SceInt32> send(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks);
+     SceInt32 cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receive_wait_threads);
+ 
+     struct WaitEntry {
+diff --git a/vita3k/kernel/include/kernel/thread/thread_state.h b/vita3k/kernel/include/kernel/thread/thread_state.h
+index 0f77fc7c..078d1406 100644
+--- a/vita3k/kernel/include/kernel/thread/thread_state.h
++++ b/vita3k/kernel/include/kernel/thread/thread_state.h
+@@ -136,16 +136,22 @@ struct ThreadState {
+     bool callbacks_notified() const { return notified_callbacks > 0; }
+ 
+     void suspend();
+-    void resume(bool step = false);
++    // Resumes a thread the debugger suspended. Returns whether it runs again, which it doesn't while
++    // a ForVM suspend holds it.
++    bool resume(bool step = false);
+     // Pause/resume the emulator without changing a thread's wait state.
+     ThreadStatus pause();
+     void resume_from_pause(ThreadStatus previous_status);
+-    // Suspends the thread for sceKernelSuspendThreadForVM: it stops before it next runs guest code
+-    // until as many vm_resume calls. Each returns the suspend count after it.
++    // Suspends the thread for sceKernelSuspendThreadForVM: it doesn't run guest code until as many
++    // vm_resume calls. vm_suspend returns once it has stopped. Each returns the suspend count after it.
+     int vm_suspend();
+     int vm_resume();
+     // Whether vm_suspend holds the thread. Called with mutex held.
+     bool vm_suspended() const { return vm_suspend_count > 0; }
++    // Waits, with mutex held through lock, until the thread no longer runs or vm_suspend no longer holds it
++    void wait_for_vm_stop(std::unique_lock<std::mutex> &lock);
++    // Whether the thread is inside a wait call, also one that ended while vm_suspend held it. Called with mutex held.
++    bool in_wait() const { return status == ThreadStatus::waiting || vm_held_in_wait; }
+     std::string log_stack_traceback() const;
+ 
+ private:
+@@ -164,6 +170,8 @@ private:
+     bool delete_requested = false;
+     // Set by suspend(), consumed in run_loop() to transition to ThreadStatus::suspended.
+     bool suspend_requested = false;
++    // Set while suspend(), a step or a breakpoint holds the thread suspended, until resume().
++    bool debugger_suspended = false;
+     // Emulator pause is separate from a guest wait or debugger suspension.
+     bool pause_requested = false;
+     bool pause_suspended = false;
+@@ -189,6 +197,8 @@ private:
+     SceUInt32 notified_callbacks = 0;
+     // The vm_suspend calls that no vm_resume undid yet.
+     int vm_suspend_count = 0;
++    // Set while vm_suspend holds the thread in a wait call that already ended.
++    bool vm_held_in_wait = false;
+     // Set while the thread runs its callbacks. They don't nest.
+     bool is_processing_callbacks = false;
+     // Callbacks this thread created, in creation order. The kernel owns them. Only this thread touches the list.
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 1a8374be..3f6cfc53 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -1121,20 +1121,36 @@ void MsgPipe::wake_waiter(WaitQueue<WaitEntry> &waiters, std::size_t available)
+     }
+ }
+ 
+-std::expected<SceSize, SceInt32> MsgPipe::receive(const ThreadStatePtr &thread, SceUInt32 wait_mode, void *buf, SceSize size, SceUInt32 *timeout, bool callbacks) {
++// The size of all the pieces together
++static uint64_t total_size(std::span<const MsgPipeVector> pieces) {
++    uint64_t total = 0;
++    for (const MsgPipeVector &piece : pieces)
++        total += piece.size;
++    return total;
++}
++
++std::expected<SceSize, SceInt32> MsgPipe::receive(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks) {
+     const bool ASAP = !(wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
+ 
+     if (!is_msg_pipe_mode(wait_mode))
+         return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_MODE);
+-    if (size > data_buffer.Capacity())
++    if (total_size(pieces) > data_buffer.Capacity())
+         return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
++    const SceSize size = static_cast<SceSize>(total_size(pieces));
+ 
++    // Fills the pieces in order with what the pipe holds
+     const auto copyOut = [&] {
+-        if (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE) {
+-            return data_buffer.Peek(buf, size);
+-        } else {
+-            return data_buffer.Remove(buf, size);
++        std::size_t copied = 0;
++        for (const MsgPipeVector &piece : pieces) {
++            if (piece.size == 0)
++                continue;
++            void *const out = piece.base.get(mem);
++            const std::size_t piece_copied = (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE) ? data_buffer.Peek(out, piece.size, copied) : data_buffer.Remove(out, piece.size);
++            copied += piece_copied;
++            if (piece_copied < piece.size)
++                break;
+         }
++        return copied;
+     };
+ 
+     auto guard = lock();
+@@ -1171,14 +1187,14 @@ std::expected<SceSize, SceInt32> MsgPipe::receive(const ThreadStatePtr &thread,
+     return copied_size;
+ }
+ 
+-// FIXME this should be SendVector!
+-std::expected<SceSize, SceInt32> MsgPipe::send(const ThreadStatePtr &thread, SceUInt32 wait_mode, const void *buf, SceSize size, SceUInt32 *timeout, bool callbacks) {
++std::expected<SceSize, SceInt32> MsgPipe::send(const ThreadStatePtr &thread, MemState &mem, SceUInt32 wait_mode, std::span<const MsgPipeVector> pieces, SceUInt32 *timeout, bool callbacks) {
+     const bool ASAP = !(wait_mode & SCE_KERNEL_MSG_PIPE_MODE_FULL);
+ 
+     if (!is_msg_pipe_mode(wait_mode))
+         return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_MODE);
+-    if (size > data_buffer.Capacity())
++    if (total_size(pieces) > data_buffer.Capacity())
+         return std::unexpected(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
++    const SceSize size = static_cast<SceSize>(total_size(pieces));
+ 
+     auto guard = lock();
+     if (!guard)
+@@ -1209,9 +1225,18 @@ std::expected<SceSize, SceInt32> MsgPipe::send(const ThreadStatePtr &thread, Sce
+             return std::unexpected(*r);
+     }
+ 
+-    const SceSize copied_size = (SceSize)data_buffer.Insert(buf, size);
++    // Copies the pieces in order into the pipe, as far as it has room
++    std::size_t copied = 0;
++    for (const MsgPipeVector &piece : pieces) {
++        if (piece.size == 0)
++            continue;
++        const std::size_t piece_copied = data_buffer.Insert(piece.base.get(mem), piece.size);
++        copied += piece_copied;
++        if (piece_copied < piece.size)
++            break;
++    }
+     wake_waiter(receivers, data_buffer.Used());
+-    return copied_size;
++    return static_cast<SceSize>(copied);
+ }
+ 
+ SceInt32 MsgPipe::cancel(SceUInt32 *num_send_wait_threads, SceUInt32 *num_receive_wait_threads) {
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index 69b74470..77a28999 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -312,9 +312,11 @@ void ThreadState::run_loop() {
+ 
+             lock.lock();
+ 
+-            if (do_step || suspend_requested || hit_breakpoint(*cpu)) {
+-                const bool debugger_suspended = do_step || hit_breakpoint(*cpu);
+-                pause_suspended = pause_requested && suspend_requested && !debugger_suspended;
++            if (do_step || suspend_requested || vm_suspended() || hit_breakpoint(*cpu)) {
++                const bool debugger_stop = do_step || hit_breakpoint(*cpu);
++                pause_suspended = pause_requested && suspend_requested && !debugger_stop;
++                // During an emulator pause, suspend_requested is the pause's
++                debugger_suspended = debugger_stop || (suspend_requested && !pause_requested);
+                 suspend_requested = false;
+                 update_status(ThreadStatus::suspended);
+             }
+@@ -534,6 +536,16 @@ WaitResult ThreadState::wait(WaitTarget target, Deadline deadline, bool callback
+         wait_cv.wait(lock, woken);
+     else
+         satisfied = wait_cv.wait_until(lock, deadline, woken);
++    // Woken while a ForVM suspend holds it, the thread stays in the call as suspended until the
++    // resume. One whose timeout passed leaves its queue first and stops in run_loop, so a later
++    // wake doesn't take the place of the timeout.
++    if (vm_suspended() && satisfied && !exiting()) {
++        wait_target = {};
++        vm_held_in_wait = true;
++        update_status(ThreadStatus::suspended);
++        wait_cv.wait(lock, [&] { return !vm_suspended() || exiting(); });
++        vm_held_in_wait = false;
++    }
+     // A wake during emulator pause must not let this guest thread run callbacks
+     // or return to its JIT loop until the pause has been lifted.
+     wait_cv.wait(lock, [&] { return !pause_requested || exiting(); });
+@@ -630,14 +642,17 @@ void ThreadState::suspend() {
+         stop(*cpu);
+ }
+ 
+-void ThreadState::resume(bool step) {
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        assert(status == ThreadStatus::suspended || status == ThreadStatus::dormant);
+-        single_stepping = step;
+-        suspend_requested = false;
+-        update_status(ThreadStatus::running);
+-    }
++bool ThreadState::resume(bool step) {
++    const std::lock_guard<std::mutex> lock(mutex);
++    assert(status == ThreadStatus::suspended || status == ThreadStatus::dormant);
++    single_stepping = step;
++    suspend_requested = false;
++    debugger_suspended = false;
++    // A ForVM suspend outlasts the debugger's
++    if (vm_suspended())
++        return false;
++    update_status(ThreadStatus::running);
++    return true;
+ }
+ 
+ ThreadStatus ThreadState::pause() {
+@@ -661,10 +676,10 @@ void ThreadState::resume_from_pause(ThreadStatus previous_status) {
+     {
+         const std::lock_guard<std::mutex> lock(mutex);
+         pause_requested = false;
+-        // A ForVM suspend made while the thread still ran outlasts the pause
+-        if (previous_status == ThreadStatus::running && !vm_suspended()) {
++        if (previous_status == ThreadStatus::running) {
+             suspend_requested = false;
+-            if (pause_suspended && status == ThreadStatus::suspended)
++            // A ForVM suspend made while the thread still ran outlasts the pause
++            if (pause_suspended && status == ThreadStatus::suspended && !vm_suspended())
+                 update_status(ThreadStatus::running);
+         }
+         pause_suspended = false;
+@@ -674,24 +689,31 @@ void ThreadState::resume_from_pause(ThreadStatus previous_status) {
+ }
+ 
+ int ThreadState::vm_suspend() {
+-    int count;
+-    {
+-        const std::lock_guard<std::mutex> lock(mutex);
+-        count = ++vm_suspend_count;
+-        suspend_requested = true;
++    std::unique_lock<std::mutex> lock(mutex);
++    const int count = ++vm_suspend_count;
++    if (status == ThreadStatus::running) {
++        stop(*cpu);
++        // Like on a Vita, return once the thread has stopped, so its context holds still
++        wait_for_vm_stop(lock);
+     }
+-    stop(*cpu);
+     return count;
+ }
+ 
++void ThreadState::wait_for_vm_stop(std::unique_lock<std::mutex> &lock) {
++    status_cond.wait(lock, [&] { return status != ThreadStatus::running || !vm_suspended() || exiting(); });
++}
++
+ int ThreadState::vm_resume() {
+     const std::lock_guard<std::mutex> lock(mutex);
+     if (vm_suspend_count == 0 || --vm_suspend_count > 0)
+         return vm_suspend_count;
+-    // A thread that didn't reach guest code since the suspend, like one still waiting, never stopped
+-    suspend_requested = false;
+-    if (status == ThreadStatus::suspended)
++    // A thread held in its wait call marks itself running once it leaves, and a suspend of the
++    // debugger's outlasts this one
++    if (status == ThreadStatus::suspended && !vm_held_in_wait && !debugger_suspended)
+         update_status(ThreadStatus::running);
++    // A thread held in its wait call waits for this, and so may a suspend that waits for it to stop
++    wait_cv.notify_all();
++    status_cond.notify_all();
+     return 0;
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 1c7d6347..9b983fbf 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -48,11 +48,15 @@ static void write_info(T *info, T full) {
+ // Waits on a simple event or a timer, which are both events.
+ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+-    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
++    const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id);
++    const TimerPtr timer = event ? nullptr : emuenv.kernel.objects.find<Timer>(event_id);
++    if (!event && !timer)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    if (callbacks)
++        thread->process_callbacks();
++    if (event)
+         return event->wait(thread, bit_pattern, result_pattern, user_data, timeout, callbacks);
+-    if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(event_id))
+-        return timer->wait(thread, result_pattern, user_data, timeout, callbacks);
+-    return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    return timer->wait(thread, result_pattern, user_data, timeout, callbacks);
+ }
+ 
+ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const char *name, unsigned int attr, Ptr<SceKernelCreateLwMutex_opt> opt) {
+@@ -575,6 +579,8 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+         return RET_ERROR(error);
+ 
+     std::unique_lock<std::mutex> lock(thread->mutex);
++    // A thread whose wait timed out while suspended stops on its way back to its code
++    thread->wait_for_vm_stop(lock);
+     if (!thread->vm_suspended())
+         return RET_ERROR(SCE_KERNEL_ERROR_NOT_SUSPENDED);
+     const auto context = save_context(*thread->cpu);
+@@ -592,7 +598,7 @@ EXPORT(int, _sceKernelGetThreadContextForVM, SceUID threadId, Ptr<SceKernelThrea
+ 
+     if (infoVfp) {
+         static_assert(sizeof(infoVfp->reg) == sizeof(context.fpu_registers));
+-        if (thread->status == ThreadStatus::waiting) {
++        if (thread->in_wait()) {
+             // Inside a syscall a Vita reports the FPSCR the kernel runs with, and only d8 to d15,
+             // which a call keeps. Every other d register reads this NaN.
+             constexpr uint32_t SCRUBBED[2] = { 0x7F80DEADU, 0x7FF8DEADU };
+@@ -728,10 +734,10 @@ EXPORT(int, _sceKernelLockMutex, SceUID mutexid, int lock_count, unsigned int *t
+ 
+ EXPORT(SceInt32, _sceKernelLockMutexCB, SceUID mutexId, SceInt32 lockCount, SceUInt32 *pTimeout) {
+     TRACY_FUNC(_sceKernelLockMutexCB, mutexId, lockCount, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const MutexPtr mutex = emuenv.kernel.objects.find<HeavyMutex>(mutexId);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return mutex->acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lockCount, pTimeout, true);
+ }
+ 
+@@ -745,10 +751,10 @@ EXPORT(SceInt32, _sceKernelLockReadRWLock, SceUID lock_id, SceUInt32 *timeout) {
+ 
+ EXPORT(SceInt32, _sceKernelLockReadRWLockCB, SceUID lock_id, SceUInt32 *timeout) {
+     TRACY_FUNC(_sceKernelLockReadRWLockCB, lock_id, timeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(lock_id);
+     if (!rwlock)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return rwlock->acquire_read(emuenv.kernel.get_thread(thread_id), timeout, true);
+ }
+ 
+@@ -762,10 +768,10 @@ EXPORT(SceInt32, _sceKernelLockWriteRWLock, SceUID lock_id, SceUInt32 *timeout)
+ 
+ EXPORT(SceInt32, _sceKernelLockWriteRWLockCB, SceUID lock_id, SceUInt32 *timeout) {
+     TRACY_FUNC(_sceKernelLockWriteRWLockCB, lock_id, timeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(lock_id);
+     if (!rwlock)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return rwlock->acquire_write(emuenv.kernel.get_thread(thread_id), timeout, true);
+ }
+ 
+@@ -944,10 +950,10 @@ EXPORT(SceInt32, _sceKernelWaitCond, SceUID condId, SceUInt32 *pTimeout) {
+ 
+ EXPORT(SceInt32, _sceKernelWaitCondCB, SceUID condId, SceUInt32 *pTimeout) {
+     TRACY_FUNC(_sceKernelWaitCondCB, condId, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const CondvarPtr condvar = emuenv.kernel.objects.find<HeavyCond>(condId);
+     if (!condvar)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_COND_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return condvar->wait(emuenv.mem, emuenv.kernel.get_thread(thread_id), pTimeout, true);
+ }
+ 
+@@ -958,7 +964,6 @@ EXPORT(SceInt32, _sceKernelWaitEvent, SceUID event_id, SceUInt32 bit_pattern, Sc
+ 
+ EXPORT(SceInt32, _sceKernelWaitEventCB, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout) {
+     TRACY_FUNC(_sceKernelWaitEventCB, event_id, bit_pattern, result_pattern, user_data, timeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return wait_event(emuenv, export_name, thread_id, event_id, bit_pattern, result_pattern, user_data, timeout, true);
+ }
+ 
+@@ -972,10 +977,10 @@ EXPORT(SceInt32, _sceKernelWaitEventFlag, SceUID evfId, SceUInt32 bitPattern, Sc
+ 
+ EXPORT(SceInt32, _sceKernelWaitEventFlagCB, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout) {
+     TRACY_FUNC(_sceKernelWaitEventFlagCB, evfId, bitPattern, waitMode, pResultPat, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const EventFlagPtr event = emuenv.kernel.objects.find<EventFlag>(evfId);
+     if (!event)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return event->wait(emuenv.kernel.get_thread(thread_id), bitPattern, waitMode, pResultPat, pTimeout, true);
+ }
+ 
+@@ -1000,11 +1005,11 @@ EXPORT(int, _sceKernelWaitLwCond, Ptr<SceKernelLwCondWork> workarea, SceUInt32 *
+ 
+ EXPORT(SceInt32, _sceKernelWaitLwCondCB, Ptr<SceKernelLwCondWork> pWork, SceUInt32 *pTimeout) {
+     TRACY_FUNC(_sceKernelWaitLwCondCB, pWork, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const auto cond_id = pWork.get(emuenv.mem)->uid;
+     const CondvarPtr condvar = emuenv.kernel.objects.find<LwCond>(cond_id);
+     if (!condvar)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return condvar->wait(emuenv.mem, emuenv.kernel.get_thread(thread_id), pTimeout, true);
+ }
+ 
+@@ -1028,10 +1033,10 @@ EXPORT(SceInt32, _sceKernelWaitSema, SceUID semaId, SceInt32 needCount, SceUInt3
+ 
+ EXPORT(SceInt32, _sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout) {
+     TRACY_FUNC(_sceKernelWaitSemaCB, semaId, needCount, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     const SemaphorePtr semaphore = emuenv.kernel.objects.find<Semaphore>(semaId);
+     if (!semaphore)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
++    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     return semaphore->wait(emuenv.kernel.get_thread(thread_id), needCount, pTimeout, true);
+ }
+ 
+@@ -1069,12 +1074,12 @@ EXPORT(int, _sceKernelWaitThreadEnd, SceUID thid, int *stat, SceUInt *timeout) {
+ EXPORT(int, _sceKernelWaitThreadEndCB, SceUID thid, int *stat, SceUInt *timeout) {
+     TRACY_FUNC(_sceKernelWaitThreadEndCB, thid, stat, timeout);
+     const ThreadStatePtr waiter = emuenv.kernel.get_thread(thread_id);
+-    waiter->process_callbacks();
+     const ThreadStatePtr target = emuenv.kernel.get_thread(thid);
+     if (!target)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_THREAD_ID);
+     if (target == waiter)
+         return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_THREAD_ID);
++    waiter->process_callbacks();
+     return wait_thread_end(waiter, target, stat, timeout, true);
+ }
+ 
+@@ -1286,6 +1291,10 @@ static int delay_thread(KernelState &kernel, SceUID thread_id, SceUInt delay_us)
+ }
+ 
+ static int delay_thread_cb(KernelState &kernel, SceUID thread_id, SceUInt delay_us) {
++    // Like the plain delay, and without running callbacks
++    if (delay_us == 0)
++        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
++
+     // Time spent in callbacks counts toward the delay
+     const Deadline deadline = std::chrono::steady_clock::now() + std::chrono::microseconds(delay_us);
+     const ThreadStatePtr thread = kernel.get_thread(thread_id);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index d9f5a0b2..dbd3db26 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1540,7 +1540,6 @@ EXPORT(int, sceKernelLockLwMutex_0, Ptr<SceKernelLwMutexWork> workarea, int lock
+ 
+ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock_count, unsigned int *ptimeout) {
+     TRACY_FUNC(sceKernelLockLwMutexCB, workarea, lock_count, ptimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+     if (!workarea)
+         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+ 
+@@ -1548,7 +1547,13 @@ EXPORT(int, sceKernelLockLwMutexCB, Ptr<SceKernelLwMutexWork> workarea, int lock
+     const MutexPtr mutex = emuenv.kernel.objects.find<LwMutex>(lwmutexid);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+-    return mutex->acquire(emuenv.mem, emuenv.kernel.get_thread(thread_id), lock_count, ptimeout, true);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
++    // A Vita takes a lightweight mutex no other thread holds in user code, which runs no callbacks
++    const SceInt32 taken = mutex->try_acquire(emuenv.mem, thread, lock_count);
++    if (taken != SCE_KERNEL_ERROR_LW_MUTEX_FAILED_TO_OWN)
++        return taken;
++    thread->process_callbacks();
++    return mutex->acquire(emuenv.mem, thread, lock_count, ptimeout, true);
+ }
+ 
+ EXPORT(int, sceKernelLockMutex, SceUID mutexid, int lock_count, unsigned int *timeout) {
+@@ -1611,37 +1616,80 @@ EXPORT(int, sceKernelPulseEventWithNotifyCallback) {
+     return UNIMPLEMENTED();
+ }
+ 
+-static SceInt32 receive_msg_pipe(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, void *pRecvBuf, SceSize recvSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
++// Whether a message pipe call failed in its wait, rather than on its arguments
++static bool is_wait_error(SceInt32 error) {
++    return error == SCE_KERNEL_ERROR_WAIT_TIMEOUT || error == SCE_KERNEL_ERROR_WAIT_DELETE || error == SCE_KERNEL_ERROR_WAIT_CANCEL;
++}
++
++// Checks the pieces of a message pipe vector call and adds up their sizes into total
++static SceInt32 msg_pipe_vector_size(const MsgPipeVector *vectors, SceUInt32 count, uint64_t &total) {
++    if (!vectors)
++        return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
++    if (count == 0)
++        return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
++    total = 0;
++    for (SceUInt32 i = 0; i < count; i++) {
++        // Even an empty piece needs a buffer
++        if (!vectors[i].base)
++            return SCE_KERNEL_ERROR_ILLEGAL_ADDR;
++        total += vectors[i].size;
++    }
++    return SCE_KERNEL_OK;
++}
++
++static SceInt32 receive_msg_pipe(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, std::span<const MsgPipeVector> pieces, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
+     const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgPipeId);
+     if (!msgpipe)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+-    const auto size = msgpipe->receive(emuenv.kernel.get_thread(thread_id), waitMode, pRecvBuf, recvSize, pTimeout, callbacks);
+-    if (!size)
++    if (callbacks)
++        emuenv.kernel.get_thread(thread_id)->process_callbacks();
++    const auto size = msgpipe->receive(emuenv.kernel.get_thread(thread_id), emuenv.mem, waitMode, pieces, pTimeout, callbacks);
++    if (!size) {
++        // A wait that ends without data still reports a size of 0
++        if (pResult && is_wait_error(size.error()))
++            *pResult = 0;
+         return size.error();
++    }
+     if (pResult)
+         *pResult = *size;
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(SceInt32, sceKernelReceiveMsgPipe, SceUID msgPipeId, void *pRecvBuf, SceSize recvSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++EXPORT(SceInt32, sceKernelReceiveMsgPipe, SceUID msgPipeId, Ptr<void> pRecvBuf, SceSize recvSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
+     TRACY_FUNC(sceKernelReceiveMsgPipe, msgPipeId, pRecvBuf, recvSize, waitMode, pResult, pTimeout);
+-    return receive_msg_pipe(emuenv, export_name, thread_id, msgPipeId, pRecvBuf, recvSize, waitMode, pResult, pTimeout, false);
++    const MsgPipeVector piece{ pRecvBuf, recvSize };
++    return receive_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { &piece, 1 }, waitMode, pResult, pTimeout, false);
+ }
+ 
+-EXPORT(SceInt32, sceKernelReceiveMsgPipeCB, SceUID msgPipeId, void *pRecvBuf, SceSize recvSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++EXPORT(SceInt32, sceKernelReceiveMsgPipeCB, SceUID msgPipeId, Ptr<void> pRecvBuf, SceSize recvSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
+     TRACY_FUNC(sceKernelReceiveMsgPipeCB, msgPipeId, pRecvBuf, recvSize, waitMode, pResult, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+-    return receive_msg_pipe(emuenv, export_name, thread_id, msgPipeId, pRecvBuf, recvSize, waitMode, pResult, pTimeout, true);
++    const MsgPipeVector piece{ pRecvBuf, recvSize };
++    return receive_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { &piece, 1 }, waitMode, pResult, pTimeout, true);
+ }
+ 
+-EXPORT(int, sceKernelReceiveMsgPipeVector) {
+-    TRACY_FUNC(sceKernelReceiveMsgPipeVector);
+-    return UNIMPLEMENTED();
++static SceInt32 receive_msg_pipe_vector(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
++    uint64_t total;
++    if (const SceInt32 error = msg_pipe_vector_size(vectors, count, total))
++        return RET_ERROR(error);
++    // A list of only empty pieces ends at once, unlike a plain ASAP call of 0 bytes
++    if (total == 0) {
++        if (!emuenv.kernel.objects.find<MsgPipe>(msgPipeId))
++            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
++        if (pResult)
++            *pResult = 0;
++        return SCE_KERNEL_OK;
++    }
++    return receive_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { vectors, count }, waitMode, pResult, pTimeout, callbacks);
+ }
+ 
+-EXPORT(int, sceKernelReceiveMsgPipeVectorCB) {
+-    TRACY_FUNC(sceKernelReceiveMsgPipeVectorCB);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelReceiveMsgPipeVector, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++    TRACY_FUNC(sceKernelReceiveMsgPipeVector, msgPipeId, vectors, count, waitMode, pResult, pTimeout);
++    return receive_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode, pResult, pTimeout, false);
++}
++
++EXPORT(SceInt32, sceKernelReceiveMsgPipeVectorCB, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++    TRACY_FUNC(sceKernelReceiveMsgPipeVectorCB, msgPipeId, vectors, count, waitMode, pResult, pTimeout);
++    return receive_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode, pResult, pTimeout, true);
+ }
+ 
+ EXPORT(int, sceKernelRegisterThreadEventHandler, const char *name, SceUID thread_mask, SceUInt32 mask, Ptr<const void> handler, Address common) {
+@@ -1653,37 +1701,59 @@ EXPORT(int, sceKernelRegisterThreadEventHandler, const char *name, SceUID thread
+     return CALL_EXPORT(_sceKernelRegisterThreadEventHandler, name, thread_mask, mask, &handler_opt);
+ }
+ 
+-static SceInt32 send_msg_pipe(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, const void *pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
++static SceInt32 send_msg_pipe(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, std::span<const MsgPipeVector> pieces, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
+     const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgPipeId);
+     if (!msgpipe)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+-    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), waitMode, pSendBuf, sendSize, pTimeout, callbacks);
+-    if (!size)
++    if (callbacks)
++        emuenv.kernel.get_thread(thread_id)->process_callbacks();
++    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), emuenv.mem, waitMode, pieces, pTimeout, callbacks);
++    if (!size) {
++        // A wait that ends without data still reports a size of 0
++        if (pResult && is_wait_error(size.error()))
++            *pResult = 0;
+         return size.error();
++    }
+     if (pResult)
+         *pResult = *size;
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(SceInt32, sceKernelSendMsgPipe, SceUID msgPipeId, const void *pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++EXPORT(SceInt32, sceKernelSendMsgPipe, SceUID msgPipeId, Ptr<const void> pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
+     TRACY_FUNC(sceKernelSendMsgPipe, msgPipeId, pSendBuf, sendSize, waitMode, pResult, pTimeout);
+-    return send_msg_pipe(emuenv, export_name, thread_id, msgPipeId, pSendBuf, sendSize, waitMode, pResult, pTimeout, false);
++    const MsgPipeVector piece{ pSendBuf.cast<void>(), sendSize };
++    return send_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { &piece, 1 }, waitMode, pResult, pTimeout, false);
+ }
+ 
+-EXPORT(SceInt32, sceKernelSendMsgPipeCB, SceUID msgPipeId, const void *pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++EXPORT(SceInt32, sceKernelSendMsgPipeCB, SceUID msgPipeId, Ptr<const void> pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
+     TRACY_FUNC(sceKernelSendMsgPipeCB, msgPipeId, pSendBuf, sendSize, waitMode, pResult, pTimeout);
+-    emuenv.kernel.get_thread(thread_id)->process_callbacks();
+-    return send_msg_pipe(emuenv, export_name, thread_id, msgPipeId, pSendBuf, sendSize, waitMode, pResult, pTimeout, true);
++    const MsgPipeVector piece{ pSendBuf.cast<void>(), sendSize };
++    return send_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { &piece, 1 }, waitMode, pResult, pTimeout, true);
+ }
+ 
+-EXPORT(int, sceKernelSendMsgPipeVector) {
+-    TRACY_FUNC(sceKernelSendMsgPipeVector);
+-    return UNIMPLEMENTED();
++static SceInt32 send_msg_pipe_vector(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout, bool callbacks) {
++    uint64_t total;
++    if (const SceInt32 error = msg_pipe_vector_size(vectors, count, total))
++        return RET_ERROR(error);
++    // A list of only empty pieces ends at once, unlike a plain ASAP call of 0 bytes
++    if (total == 0) {
++        if (!emuenv.kernel.objects.find<MsgPipe>(msgPipeId))
++            return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
++        if (pResult)
++            *pResult = 0;
++        return SCE_KERNEL_OK;
++    }
++    return send_msg_pipe(emuenv, export_name, thread_id, msgPipeId, { vectors, count }, waitMode, pResult, pTimeout, callbacks);
+ }
+ 
+-EXPORT(int, sceKernelSendMsgPipeVectorCB) {
+-    TRACY_FUNC(sceKernelSendMsgPipeVectorCB);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelSendMsgPipeVector, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++    TRACY_FUNC(sceKernelSendMsgPipeVector, msgPipeId, vectors, count, waitMode, pResult, pTimeout);
++    return send_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode, pResult, pTimeout, false);
++}
++
++EXPORT(SceInt32, sceKernelSendMsgPipeVectorCB, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult, SceUInt32 *pTimeout) {
++    TRACY_FUNC(sceKernelSendMsgPipeVectorCB, msgPipeId, vectors, count, waitMode, pResult, pTimeout);
++    return send_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode, pResult, pTimeout, true);
+ }
+ 
+ EXPORT(int, sceKernelSetEventWithNotifyCallback) {
+@@ -1782,12 +1852,13 @@ EXPORT(int, sceKernelTryLockLwMutex_16XX, Ptr<SceKernelLwMutexWork> workarea, in
+     return CALL_EXPORT(sceKernelTryLockLwMutex, workarea, lock_count);
+ }
+ 
+-EXPORT(int, sceKernelTryReceiveMsgPipe, SceUID msgpipe_id, char *recv_buf, SceSize msg_size, SceUInt32 wait_mode, SceSize *result) {
++EXPORT(int, sceKernelTryReceiveMsgPipe, SceUID msgpipe_id, Ptr<void> recv_buf, SceSize msg_size, SceUInt32 wait_mode, SceSize *result) {
+     TRACY_FUNC(sceKernelTryReceiveMsgPipe, msgpipe_id, recv_buf, msg_size, wait_mode, result);
+     const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgpipe_id);
+     if (!msgpipe)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+-    const auto size = msgpipe->receive(emuenv.kernel.get_thread(thread_id), wait_mode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, recv_buf, msg_size, nullptr, false);
++    const MsgPipeVector piece{ recv_buf, msg_size };
++    const auto size = msgpipe->receive(emuenv.kernel.get_thread(thread_id), emuenv.mem, wait_mode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, { &piece, 1 }, nullptr, false);
+     if (result)
+         *result = size.value_or(0);
+     if (!size)
+@@ -1795,17 +1866,23 @@ EXPORT(int, sceKernelTryReceiveMsgPipe, SceUID msgpipe_id, char *recv_buf, SceSi
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, sceKernelTryReceiveMsgPipeVector) {
+-    TRACY_FUNC(sceKernelTryReceiveMsgPipeVector);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelTryReceiveMsgPipeVector, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult) {
++    TRACY_FUNC(sceKernelTryReceiveMsgPipeVector, msgPipeId, vectors, count, waitMode, pResult);
++    // Like sceKernelTryReceiveMsgPipe, it writes a size of 0 whenever it fails
++    SceSize size = 0;
++    const SceInt32 result = receive_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, &size, nullptr, false);
++    if (pResult)
++        *pResult = size;
++    return result;
+ }
+ 
+-EXPORT(int, sceKernelTrySendMsgPipe, SceUID msgPipeId, const void *pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult) {
++EXPORT(int, sceKernelTrySendMsgPipe, SceUID msgPipeId, Ptr<const void> pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult) {
+     TRACY_FUNC(sceKernelTrySendMsgPipe, msgPipeId, pSendBuf, sendSize, waitMode, pResult);
+     const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgPipeId);
+     if (!msgpipe)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+-    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), waitMode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, pSendBuf, sendSize, nullptr, false);
++    const MsgPipeVector piece{ pSendBuf.cast<void>(), sendSize };
++    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), emuenv.mem, waitMode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, { &piece, 1 }, nullptr, false);
+     if (pResult)
+         *pResult = size.value_or(0);
+     if (!size)
+@@ -1813,9 +1890,14 @@ EXPORT(int, sceKernelTrySendMsgPipe, SceUID msgPipeId, const void *pSendBuf, Sce
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, sceKernelTrySendMsgPipeVector) {
+-    TRACY_FUNC(sceKernelTrySendMsgPipeVector);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelTrySendMsgPipeVector, SceUID msgPipeId, const MsgPipeVector *vectors, SceUInt32 count, SceUInt32 waitMode, SceSize *pResult) {
++    TRACY_FUNC(sceKernelTrySendMsgPipeVector, msgPipeId, vectors, count, waitMode, pResult);
++    // Like sceKernelTrySendMsgPipe, it writes a size of 0 whenever it fails
++    SceSize size = 0;
++    const SceInt32 result = send_msg_pipe_vector(emuenv, export_name, thread_id, msgPipeId, vectors, count, waitMode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, &size, nullptr, false);
++    if (pResult)
++        *pResult = size;
++    return result;
+ }
+ 
+ EXPORT(int, sceKernelUnloadModule, SceUID uid, SceUInt32 flags, const void *pOpt) {
+diff --git a/vita3k/util/include/util/byte_ring_buffer.h b/vita3k/util/include/util/byte_ring_buffer.h
+index 2e164407..43c6cf84 100644
+--- a/vita3k/util/include/util/byte_ring_buffer.h
++++ b/vita3k/util/include/util/byte_ring_buffer.h
+@@ -55,22 +55,17 @@ public:
+         return removed;
+     }
+ 
+-    std::size_t Peek(void *out, std::size_t size) const {
+-        if (Empty()) {
++    // Copies up to size bytes, from offset bytes past the oldest one, without removing them
++    std::size_t Peek(void *out, std::size_t size, std::size_t offset = 0) const {
++        if (offset >= used) {
+             return 0;
+         }
+ 
+-        const std::size_t extractSize = std::min(size, Used());
+-        if (start < end) { // Data between 'start' and 'end'-1
+-            memcpy(out, &buffer[start], extractSize);
+-        } else { // Data between 'start' and buffer end, and potentially between 0 and 'end'-1
+-            const std::size_t bufTailSize = std::min(capacity - start, extractSize); // Size of stuff to copy between 'start' and buffer end
+-            const std::size_t bufHeadSize = std::min(end, extractSize - bufTailSize); // Size of stuff to copy at buffer start
+-
+-            assert((bufTailSize + bufHeadSize) == extractSize);
+-            memcpy(out, &buffer[start], bufTailSize);
+-            memcpy(static_cast<char *>(out) + bufTailSize, &buffer[0], bufHeadSize);
+-        }
++        const std::size_t extractSize = std::min(size, used - offset);
++        const std::size_t from = (start + offset) % capacity;
++        const std::size_t bufTailSize = std::min(capacity - from, extractSize); // Size of stuff to copy between 'from' and buffer end
++        memcpy(out, &buffer[from], bufTailSize);
++        memcpy(static_cast<char *>(out) + bufTailSize, &buffer[0], extractSize - bufTailSize);
+         return extractSize;
+     }
+ 
+-- 
+2.54.0.windows.1
+

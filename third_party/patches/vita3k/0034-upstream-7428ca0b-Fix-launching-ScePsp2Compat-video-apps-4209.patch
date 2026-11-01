@@ -1,0 +1,234 @@
+From c969f3361bd3674ea8ca6eab13f087b0541f86a5 Mon Sep 17 00:00:00 2001
+From: nishinji <107111782+nishinji@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:42:25 +0900
+Subject: [PATCH 34/52] Fix launching ScePsp2Compat video apps (#4209)
+
+* sysmem: Provide the system font memblocks and add the cache0: device
+
+(cherry picked from commit 7428ca0bd7d96bf51533b1e2aead3be95f58ae68)
+---
+ vita3k/interface.cpp                          |  2 +
+ vita3k/io/include/io/VitaIoDevice.h           |  2 +
+ vita3k/io/include/io/state.h                  |  1 +
+ vita3k/io/src/io.cpp                          | 10 ++++-
+ vita3k/modules/SceAppUtil/SceAppUtilCache.cpp | 21 +++++++++-
+ vita3k/modules/SceSysmem/SceSysmem.cpp        | 42 +++++++++++++++++++
+ vita3k/modules/include/modules/sysmem_state.h |  4 ++
+ 7 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 1c291f47..8c98dda7 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -41,6 +41,7 @@
+ #include <pugixml.hpp>
+ 
+ #include <modules/module_parent.h>
++#include <modules/sysmem_state.h>
+ #include <string>
+ #include <util/log.h>
+ #include <util/string_utils.h>
+@@ -534,6 +535,7 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
+         sfo::load(emuenv.sfo_handle, param_sfo);
+ 
+     init_exported_vars(emuenv);
++    create_system_font_blocks(emuenv);
+ 
+     // Load main executable
+     if (!launch_request.self_path.empty()) {
+diff --git a/vita3k/io/include/io/VitaIoDevice.h b/vita3k/io/include/io/VitaIoDevice.h
+index c777ba27..ea701f14 100644
+--- a/vita3k/io/include/io/VitaIoDevice.h
++++ b/vita3k/io/include/io/VitaIoDevice.h
+@@ -24,6 +24,7 @@
+ enum class VitaIoDevice : int {
+     addcont0 = 0,
+     app0,
++    cache0,
+     host0,
+     gro0,
+     grw0,
+@@ -55,6 +56,7 @@ enum class VitaIoDevice : int {
+ BOOST_DESCRIBE_ENUM(VitaIoDevice,
+     addcont0,
+     app0,
++    cache0,
+     host0,
+     grw0,
+     imc0,
+diff --git a/vita3k/io/include/io/state.h b/vita3k/io/include/io/state.h
+index e264b5fb..bb4f0696 100644
+--- a/vita3k/io/include/io/state.h
++++ b/vita3k/io/include/io/state.h
+@@ -103,6 +103,7 @@ struct IOState {
+         std::string app0;
+         std::string savedata0;
+         std::string addcont0;
++        std::string cache0;
+     } device_paths;
+ 
+     std::string addcont;
+diff --git a/vita3k/io/src/io.cpp b/vita3k/io/src/io.cpp
+index 8b83e63e..d6d71cde 100644
+--- a/vita3k/io/src/io.cpp
++++ b/vita3k/io/src/io.cpp
+@@ -96,7 +96,7 @@ SceSize get_directory_used_size(const VitaIoDevice device, const std::string &vf
+ 
+ static bool is_valid_output_path(const VitaIoDevice device) {
+     return !(device == VitaIoDevice::savedata0 || device == VitaIoDevice::savedata1 || device == VitaIoDevice::app0
+-        || device == VitaIoDevice::_INVALID || device == VitaIoDevice::addcont0 || device == VitaIoDevice::tty0
++        || device == VitaIoDevice::_INVALID || device == VitaIoDevice::addcont0 || device == VitaIoDevice::cache0 || device == VitaIoDevice::tty0
+         || device == VitaIoDevice::tty1 || device == VitaIoDevice::tty2 || device == VitaIoDevice::tty3
+         || device == VitaIoDevice::music0 || device == VitaIoDevice::photo0 || device == VitaIoDevice::video0);
+ }
+@@ -163,6 +163,7 @@ void init_device_paths(IOState &io) {
+     io.device_paths.savedata0 = "user/" + io.user_id + "/savedata/" + io.savedata;
+     io.device_paths.app0 = "app/" + io.app_path;
+     io.device_paths.addcont0 = "addcont/" + io.addcont;
++    io.device_paths.cache0.clear();
+ }
+ 
+ bool init_savedata_app_path(IOState &io, const fs::path &vita_fs_path) {
+@@ -248,6 +249,13 @@ std::string translate_path(const char *path, VitaIoDevice &device, const IOState
+         device = VitaIoDevice::ux0;
+         break;
+     }
++    case VitaIoDevice::cache0: { // Redirect cache0: to ux0:cache/<title_id>
++        if (device_paths.cache0.empty())
++            return std::string{};
++        relative_path = device::remove_device_from_path(relative_path, device, device_paths.cache0);
++        device = VitaIoDevice::ux0;
++        break;
++    }
+     case VitaIoDevice::music0: { // Redirect music0: to ux0:music
+         relative_path = device::remove_device_from_path(relative_path, device, "music");
+         device = VitaIoDevice::ux0;
+diff --git a/vita3k/modules/SceAppUtil/SceAppUtilCache.cpp b/vita3k/modules/SceAppUtil/SceAppUtilCache.cpp
+index f07574f7..6a3526d9 100644
+--- a/vita3k/modules/SceAppUtil/SceAppUtilCache.cpp
++++ b/vita3k/modules/SceAppUtil/SceAppUtilCache.cpp
+@@ -17,14 +17,31 @@
+ 
+ #include <module/module.h>
+ 
++#include <emuenv/app_util.h>
++#include <emuenv/state.h>
++#include <io/state.h>
++
+ EXPORT(int, sceAppUtilCacheGetDevInfo) {
+     return UNIMPLEMENTED();
+ }
+ 
+ EXPORT(int, sceAppUtilCacheMount) {
+-    return UNIMPLEMENTED();
++    const auto cache_path = "cache/" + emuenv.io.title_id;
++    boost::system::error_code ec;
++    fs::create_directories(emuenv.vita_fs_path / "ux0" / cache_path, ec);
++    if (ec) {
++        LOG_ERROR("Failed to create cache directory: {}", ec.message());
++        return RET_ERROR(SCE_APPUTIL_ERROR_NOT_MOUNTED);
++    }
++
++    emuenv.io.device_paths.cache0 = cache_path;
++    return 0;
+ }
+ 
+ EXPORT(int, sceAppUtilCacheUmount) {
+-    return UNIMPLEMENTED();
++    if (emuenv.io.device_paths.cache0.empty())
++        return RET_ERROR(SCE_APPUTIL_ERROR_NOT_MOUNTED);
++
++    emuenv.io.device_paths.cache0.clear();
++    return 0;
+ }
+diff --git a/vita3k/modules/SceSysmem/SceSysmem.cpp b/vita3k/modules/SceSysmem/SceSysmem.cpp
+index a1cdc210..5cb55e35 100644
+--- a/vita3k/modules/SceSysmem/SceSysmem.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmem.cpp
+@@ -18,15 +18,21 @@
+ #include "SceSysmem.h"
+ #include "SceSysmemForDriver.h"
+ 
++#include <emuenv/state.h>
+ #include <kernel/state.h>
+ #include <kernel/types.h>
++#include <mem/functions.h>
+ #include <modules/sysmem_state.h>
+ 
+ #include <packages/sfo.h>
+ 
+ #include <util/align.h>
++#include <util/fs.h>
+ #include <util/string_utils.h>
+ 
++#include <array>
++#include <utility>
++
+ #include <util/tracy.h>
+ 
+ #include <algorithm>
+@@ -332,6 +338,42 @@ EXPORT(bool, sceKernelIsPSVitaTV) {
+     return emuenv.cfg.current_config.pstv_mode;
+ }
+ 
++void create_system_font_blocks(EmuEnvState &emuenv) {
++    constexpr std::array<std::pair<const char *, const char *>, 2> fonts = { {
++        { "SceSysDefaultLtnFont", "ltn0.pvf" },
++        { "SceSysDefaultJpnFont", "jpn0.pvf" },
++    } };
++
++    const auto state = emuenv.kernel.obj_store.get<SysmemState>();
++    const std::lock_guard<std::mutex> guard(state->mutex);
++
++    for (const auto &[name, file] : fonts) {
++        std::vector<uint8_t> data;
++        if (!fs_utils::read_data(emuenv.vita_fs_path / "sa0/data/font/pvf" / file, data) || data.empty()) {
++            LOG_WARN("Missing {} for {}, install the firmware font package", file, name);
++            continue;
++        }
++
++        const uint32_t size = align(static_cast<uint32_t>(data.size()), 0x1000);
++        // Below main memory and far above the uncached range, so app allocations keep their addresses.
++        const Ptr<uint8_t> address(alloc_aligned(emuenv.mem, size, name, 0x1000, 0x7F000000));
++        if (!address)
++            continue;
++        memcpy(address.get(emuenv.mem), data.data(), data.size());
++
++        // Not add_block: the shell owns these blocks, so they must not count against the app's memory.
++        const auto block = std::make_shared<KernelMemBlock>();
++        block->type = SCE_KERNEL_MEMBLOCK_TYPE_USER_RW;
++        block->mappedBase = address;
++        block->mappedSize = size;
++        block->size = sizeof(SceKernelMemBlockInfo);
++        block->memoryType = SCE_KERNEL_MEMORY_TYPE_NORMAL;
++        block->access = SCE_KERNEL_MEMORY_ACCESS_R | SCE_KERNEL_MEMORY_ACCESS_W;
++        std::strncpy(block->name, name, KERNELOBJECT_MAX_NAME_LENGTH);
++        state->blocks.emplace(state->get_next_uid(), block);
++    }
++}
++
+ EXPORT(SceUID, sceKernelOpenMemBlock, const char *pName, int flags) {
+     TRACY_FUNC(sceKernelOpenMemBlock, pName, flags);
+     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+diff --git a/vita3k/modules/include/modules/sysmem_state.h b/vita3k/modules/include/modules/sysmem_state.h
+index f040797a..eeb6fced 100644
+--- a/vita3k/modules/include/modules/sysmem_state.h
++++ b/vita3k/modules/include/modules/sysmem_state.h
+@@ -24,6 +24,7 @@
+ #include <mutex>
+ #include <string>
+ 
++struct EmuEnvState;
+ struct MemState;
+ 
+ // Shared SysmemState definition used by SceSysmem and kubridge HLE.
+@@ -54,3 +55,6 @@ struct SysmemState {
+         return next_uid++;
+     }
+ };
++
++// The shell keeps these fonts in shared blocks that libpvf and WebKit open by name before an app starts.
++void create_system_font_blocks(EmuEnvState &emuenv);
+-- 
+2.54.0.windows.1
+

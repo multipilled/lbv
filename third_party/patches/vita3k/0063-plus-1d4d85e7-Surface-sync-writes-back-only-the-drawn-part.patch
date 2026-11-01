@@ -1,0 +1,281 @@
+From 1cb465b7786bb71ddb49b173969b7ac6d9b6f361 Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:55:50 -0400
+Subject: [PATCH] Surface sync writes back only the part of a surface its
+ scenes drew into (Vita3K-Plus 1d4d85e718)
+
+---
+ .../include/renderer/vulkan/surface_cache.h   | 11 +++++
+ .../renderer/include/renderer/vulkan/types.h  | 10 ++++
+ vita3k/renderer/src/vulkan/context.cpp        | 40 +++++++++++++---
+ vita3k/renderer/src/vulkan/scene.cpp          | 21 +++++++++
+ vita3k/renderer/src/vulkan/surface_cache.cpp  | 47 ++++++++++++++++++-
+ 5 files changed, 122 insertions(+), 7 deletions(-)
+
+diff --git a/vita3k/renderer/include/renderer/vulkan/surface_cache.h b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+index 651a6ca76..55faeaca4 100644
+--- a/vita3k/renderer/include/renderer/vulkan/surface_cache.h
++++ b/vita3k/renderer/include/renderer/vulkan/surface_cache.h
+@@ -109,6 +109,15 @@ struct ColorSurfaceCacheInfo : public SurfaceCacheInfo {
+     // surface sync's copy for the CPU, in cached system memory (vkutil::vma_readback_alloc)
+     std::unique_ptr<vkutil::Buffer> readback_buffer;
+ 
++    // the part of the surface its scenes have drawn into (unscaled, whole 32x32 tiles; empty until the first scene
++    // ends): surface sync writes back only that (Vita3K-Plus 1d4d85e718)
++    int32_t written_x0 = INT32_MAX;
++    int32_t written_y0 = INT32_MAX;
++    int32_t written_x1 = 0;
++    int32_t written_y1 = 0;
++    // the rectangle the last surface sync copied (sync_w 0: the whole surface)
++    uint32_t sync_x0 = 0, sync_y0 = 0, sync_w = 0, sync_h = 0;
++
+     // pointer shared with the memory trap indicating if this surface sync is needed
+     std::shared_ptr<bool> need_surface_sync;
+ 
+@@ -273,6 +282,8 @@ public:
+ 
+     // If non-null, the return value must be sent as a PostSurfaceSyncRequest
+     ColorSurfaceCacheInfo *perform_surface_sync();
++    // folds a scene's drawn rectangle (scaled coordinates) into the current colour surface's written part
++    void note_scene_draw_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1);
+ 
+     // Called after the render has been done
+     void perform_post_surface_sync(const MemState &mem, ColorSurfaceCacheInfo *surface);
+diff --git a/vita3k/renderer/include/renderer/vulkan/types.h b/vita3k/renderer/include/renderer/vulkan/types.h
+index 77520509a..47ecd6209 100644
+--- a/vita3k/renderer/include/renderer/vulkan/types.h
++++ b/vita3k/renderer/include/renderer/vulkan/types.h
+@@ -220,6 +220,10 @@ struct BufferSyncRequest {
+     bool query_results = false;
+     // the frame of the command list that wrote them (VITA3K_TRACE_QUERIES)
+     uint64_t frame = 0;
++    // a rectangle of the surface only (row_count rows of row_bytes, row_stride apart, from location and source)
++    uint32_t row_stride = 0;
++    uint32_t row_bytes = 0;
++    uint32_t row_count = 0;
+ };
+ 
+ // A parallel thread is handling these request and telling other waiting threads
+@@ -301,6 +305,12 @@ struct VKContext : public renderer::Context {
+     VKRenderTarget *render_target = nullptr;
+     vk::Viewport viewport;
+     vk::Rect2D scissor;
++    // the union of scissor x viewport of the scene's draws: the only part of the colour surface the GPU can have
++    // written (VKSurfaceCache::note_scene_draw_rect, Vita3K-Plus 1d4d85e718)
++    int32_t draw_rect_x0 = INT32_MAX;
++    int32_t draw_rect_y0 = INT32_MAX;
++    int32_t draw_rect_x1 = 0;
++    int32_t draw_rect_y1 = 0;
+     SceGxmPrimitiveType last_primitive;
+ 
+     vk::RenderPass current_render_pass;
+diff --git a/vita3k/renderer/src/vulkan/context.cpp b/vita3k/renderer/src/vulkan/context.cpp
+index 5bdef612f..168fd4c5b 100644
+--- a/vita3k/renderer/src/vulkan/context.cpp
++++ b/vita3k/renderer/src/vulkan/context.cpp
+@@ -257,8 +257,18 @@ void VKContext::wait_thread_function(const MemState &mem) {
+                        },
+                        [&](BufferSyncRequest &request) {
+                            wait_for_fences();
++                           // a rectangle: row by row, leaving the bytes between the rows alone
++                           const auto copy_rows = [&](const uint8_t *src) {
++                               uint8_t *dst = Ptr<uint8_t>(request.location).get(mem);
++                               if (!request.row_count) {
++                                   memcpy(dst, src, request.size);
++                                   return;
++                               }
++                               for (uint32_t row = 0; row < request.row_count; row++)
++                                   memcpy(dst + row * request.row_stride, src + row * request.row_stride, request.row_bytes);
++                           };
+                            if (request.source) {
+-                               memcpy(Ptr<void>(request.location).get(mem), request.source, request.size);
++                               copy_rows(request.source);
+                                trace_synced_bytes(mem, request.location, request.size);
+                                return;
+                            }
+@@ -269,7 +279,7 @@ void VKContext::wait_thread_function(const MemState &mem) {
+                            }
+                            uint8_t *src = reinterpret_cast<uint8_t *>(std::get<vkutil::Buffer>(mem_it->second.buffer_impl).mapped_data);
+                            src += request.location - mem_it->first;
+-                           memcpy(Ptr<void>(request.location).get(mem), src, request.size);
++                           copy_rows(src);
+                            trace_synced_bytes(mem, request.location, request.size);
+                            if (request.query_results) {
+                                trace_query_results(mem, request.location, request.size, request.frame);
+@@ -297,6 +307,10 @@ void VKContext::wait_thread_function(const MemState &mem) {
+ }
+ 
+ void set_context(VKContext &context, MemState &mem, VKRenderTarget *rt, const FeatureState &features) {
++    context.draw_rect_x0 = INT32_MAX;
++    context.draw_rect_y0 = INT32_MAX;
++    context.draw_rect_x1 = 0;
++    context.draw_rect_y1 = 0;
+     context.render_target = rt;
+     context.scene_timestamp++;
+     context.state.texture_cache.current_scene_timestamp = context.scene_timestamp;
+@@ -693,8 +707,10 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+     }
+ 
+     ColorSurfaceCacheInfo *surface_info = nullptr;
+-    if (state.features.enable_memory_mapping && !state.disable_surface_sync && submit)
++    if (state.features.enable_memory_mapping && !state.disable_surface_sync && submit) {
++        state.surface_cache.note_scene_draw_rect(draw_rect_x0, draw_rect_y0, draw_rect_x1, draw_rect_y1);
+         surface_info = state.surface_cache.perform_surface_sync();
++    }
+ 
+     prerender_cmd.end();
+     render_cmd.end();
+@@ -741,10 +757,22 @@ void VKContext::stop_recording(const SceGxmNotification &notif1, const SceGxmNot
+             if (surface_info && surface_info->need_buffer_sync) {
+                 const vkutil::Buffer *readback = surface_info->readback_buffer.get();
+                 const uint32_t size = static_cast<uint32_t>(surface_info->total_bytes);
++                BufferSyncRequest request{ surface_info->data.address(), size };
+                 if (readback && readback->mapped_data && readback->size >= size)
+-                    state.request_queue.push(BufferSyncRequest{ surface_info->data.address(), size, static_cast<const uint8_t *>(readback->mapped_data) });
+-                else
+-                    state.request_queue.push(BufferSyncRequest{ surface_info->data.address(), size });
++                    request.source = static_cast<const uint8_t *>(readback->mapped_data);
++                if (surface_info->sync_w) {
++                    // only the rectangle the sync copied (VKSurfaceCache::perform_surface_sync)
++                    const uint32_t bpp = gxm::bits_per_pixel(surface_info->format) / 8;
++                    const uint32_t start = surface_info->sync_y0 * static_cast<uint32_t>(surface_info->stride_bytes) + surface_info->sync_x0 * bpp;
++                    request.location += start;
++                    if (request.source)
++                        request.source += start;
++                    request.row_stride = static_cast<uint32_t>(surface_info->stride_bytes);
++                    request.row_bytes = surface_info->sync_w * bpp;
++                    request.row_count = surface_info->sync_h;
++                    request.size = (request.row_count - 1) * request.row_stride + request.row_bytes;
++                }
++                state.request_queue.push(request);
+             }
+         }
+ 
+diff --git a/vita3k/renderer/src/vulkan/scene.cpp b/vita3k/renderer/src/vulkan/scene.cpp
+index ac960d78e..ff3e7b84b 100644
+--- a/vita3k/renderer/src/vulkan/scene.cpp
++++ b/vita3k/renderer/src/vulkan/scene.cpp
+@@ -33,6 +33,8 @@
+ #include <fstream>
+ #include <map>
+ #include <mutex>
++#include <algorithm>
++#include <cmath>
+ #include <set>
+ #include <variant>
+ 
+@@ -569,6 +571,25 @@ void draw(VKContext &context, SceGxmPrimitiveType type, SceGxmIndexFormat format
+ 
+     context.check_for_macroblock_change(true);
+ 
++    {
++        // scissor x viewport bounds what this draw can rasterize (VKSurfaceCache::note_scene_draw_rect)
++        const int32_t sx0 = context.scissor.offset.x, sy0 = context.scissor.offset.y;
++        const int32_t sx1 = sx0 + static_cast<int32_t>(context.scissor.extent.width);
++        const int32_t sy1 = sy0 + static_cast<int32_t>(context.scissor.extent.height);
++        const vk::Viewport &vp = context.viewport;
++        const int32_t vx0 = static_cast<int32_t>(std::floor(std::min(vp.x, vp.x + vp.width)));
++        const int32_t vy0 = static_cast<int32_t>(std::floor(std::min(vp.y, vp.y + vp.height)));
++        const int32_t vx1 = static_cast<int32_t>(std::ceil(std::max(vp.x, vp.x + vp.width)));
++        const int32_t vy1 = static_cast<int32_t>(std::ceil(std::max(vp.y, vp.y + vp.height)));
++        const int32_t x0 = std::max(sx0, vx0), y0 = std::max(sy0, vy0), x1 = std::min(sx1, vx1), y1 = std::min(sy1, vy1);
++        if (x1 > x0 && y1 > y0) {
++            context.draw_rect_x0 = std::min(context.draw_rect_x0, x0);
++            context.draw_rect_y0 = std::min(context.draw_rect_y0, y0);
++            context.draw_rect_x1 = std::max(context.draw_rect_x1, x1);
++            context.draw_rect_y1 = std::max(context.draw_rect_y1, y1);
++        }
++    }
++
+     if (!context.in_renderpass)
+         context.start_render_pass();
+ 
+diff --git a/vita3k/renderer/src/vulkan/surface_cache.cpp b/vita3k/renderer/src/vulkan/surface_cache.cpp
+index 5bc1e2b7e..e28944351 100644
+--- a/vita3k/renderer/src/vulkan/surface_cache.cpp
++++ b/vita3k/renderer/src/vulkan/surface_cache.cpp
+@@ -27,6 +27,9 @@
+ #include <vulkan/vulkan_format_traits.hpp>
+ 
+ #include <util/align.h>
++
++#include <algorithm>
++#include <cmath>
+ #include <util/log.h>
+ #include <util/vector_utils.h>
+ 
+@@ -508,6 +511,10 @@ SurfaceRetrieveResult VKSurfaceCache::retrieve_color_surface_for_framebuffer(Mem
+     last_written_surface = &info_added;
+     info_added.need_surface_sync.reset();
+     info_added.need_surface_sync = std::make_shared<bool>(false);
++    info_added.written_x0 = INT32_MAX;
++    info_added.written_y0 = INT32_MAX;
++    info_added.written_x1 = 0;
++    info_added.written_y1 = 0;
+     info_added.dirty = std::make_shared<bool>(false);
+     info_added.gpu_read_sync_only = false;
+ 
+@@ -1637,6 +1644,25 @@ bool VKSurfaceCache::sync_surface_for_gpu_read(Address address, uint32_t size) {
+     return true;
+ }
+ 
++void VKSurfaceCache::note_scene_draw_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
++    if (!last_written_surface || x1 <= x0 || y1 <= y0)
++        return;
++    ColorSurfaceCacheInfo &info = *last_written_surface;
++    // scaled to unscaled, rounded outward to the 32x32 tiles the hardware writes back whole
++    const float inv = 1.0f / state.res_multiplier;
++    const int32_t w = static_cast<int32_t>(info.original_width), h = static_cast<int32_t>(info.original_height);
++    const int32_t ux0 = std::clamp(static_cast<int32_t>(std::floor(x0 * inv / 32.0f)) * 32, 0, w);
++    const int32_t uy0 = std::clamp(static_cast<int32_t>(std::floor(y0 * inv / 32.0f)) * 32, 0, h);
++    const int32_t ux1 = std::clamp(static_cast<int32_t>(std::ceil(x1 * inv / 32.0f)) * 32, 0, w);
++    const int32_t uy1 = std::clamp(static_cast<int32_t>(std::ceil(y1 * inv / 32.0f)) * 32, 0, h);
++    if (ux1 <= ux0 || uy1 <= uy0)
++        return;
++    info.written_x0 = std::min(info.written_x0, ux0);
++    info.written_y0 = std::min(info.written_y0, uy0);
++    info.written_x1 = std::max(info.written_x1, ux1);
++    info.written_y1 = std::max(info.written_y1, uy1);
++}
++
+ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+     // surface sync is supported only if memory mapping is enabled
+     if (!state.features.enable_memory_mapping)
+@@ -1770,6 +1796,25 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+         .imageOffset = { 0, 0, 0 },
+         .imageExtent = { last_written_surface->original_width, last_written_surface->original_height, 1 }
+     };
++    // write back only the part the scenes drew into: the rest of the surface's memory may hold other data the
++    // GPU never wrote (LBP's 768x1024 bloom surface, drawn in 384-wide viewports: its full write-back left the
++    // tutorial on flat grey instead of its gradient; Vita3K-Plus 1d4d85e718). Same buffer layout, so the copy
++    // starts at the rectangle's first texel.
++    ColorSurfaceCacheInfo &ws = *last_written_surface;
++    ws.sync_x0 = ws.sync_y0 = ws.sync_w = ws.sync_h = 0;
++    if (!format_need_additional_memory(ws.format) && ws.written_x1 > ws.written_x0 && ws.written_y1 > ws.written_y0
++        && (ws.written_x0 > 0 || ws.written_y0 > 0 || ws.written_x1 < static_cast<int32_t>(ws.original_width)
++            || ws.written_y1 < static_cast<int32_t>(ws.original_height))) {
++        ws.sync_x0 = ws.written_x0;
++        ws.sync_y0 = ws.written_y0;
++        ws.sync_w = ws.written_x1 - ws.written_x0;
++        ws.sync_h = ws.written_y1 - ws.written_y0;
++        const uint32_t bpp = gxm::bits_per_pixel(ws.format) / 8;
++        copy.bufferOffset += (static_cast<vk::DeviceSize>(ws.sync_y0) * pixel_stride + ws.sync_x0) * bpp;
++        copy.imageOffset = vk::Offset3D{ static_cast<int32_t>(ws.sync_x0), static_cast<int32_t>(ws.sync_y0), 0 };
++        copy.imageExtent = vk::Extent3D{ ws.sync_w, ws.sync_h, 1 };
++    }
++    const vk::DeviceSize rect_offset = copy.bufferOffset - offset;
+     cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, buffer, copy);
+ 
+     if (last_written_surface->need_buffer_sync) {
+@@ -1780,7 +1825,7 @@ ColorSurfaceCacheInfo *VKSurfaceCache::perform_surface_sync() {
+             last_written_surface->readback_buffer = std::make_unique<vkutil::Buffer>(readback_size);
+             last_written_surface->readback_buffer->init_buffer(vk::BufferUsageFlagBits::eTransferDst, vkutil::vma_readback_alloc);
+         }
+-        copy.bufferOffset = 0;
++        copy.bufferOffset = rect_offset;
+         cmd_buffer.copyImageToBuffer(image_to_copy, image_layout, last_written_surface->readback_buffer->buffer, copy);
+     }
+ 
+-- 
+2.54.0.windows.1
+

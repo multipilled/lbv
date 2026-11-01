@@ -1,0 +1,192 @@
+diff --git a/recomp/armrecomp/neon.py b/recomp/armrecomp/neon.py
+index 6f9d585..22aca6f 100644
+--- a/recomp/armrecomp/neon.py
++++ b/recomp/armrecomp/neon.py
+@@ -26,7 +26,7 @@ NEON_ONLY = {'vdup', 'vbif', 'vbit', 'vbsl', 'vext', 'vrev64', 'vrev32', 'vrev16
+              'vqmovn', 'vqmovun', 'vmovl', 'vaddw', 'vsubw', 'vaddl', 'vsubl', 'vshrn', 'vqshrn', 'vqshrun',
+              'vrshrn', 'vshr', 'vsra', 'vshl', 'vqadd', 'vqsub', 'vqabs', 'vqneg', 'vtst', 'vceq', 'vcge',
+              'vcgt', 'vcle', 'vclt', 'vacgt', 'vacge', 'vrecpe', 'vrecps', 'vrsqrte', 'vrsqrts', 'vmax',
+-             'vmin', 'vswp', 'vcnt', 'vclz', 'vpaddl', 'vsli', 'vsri'}
++             'vmin', 'vswp', 'vcnt', 'vclz', 'vpaddl', 'vsli', 'vsri', 'vhadd', 'vrhadd'}
+ 
+ 
+ class Unsupported(Exception):
+@@ -181,7 +181,7 @@ def translate(cx):
+         (d, nb, _), (m, _, _) = regs()
+         emit(f'vrev<{INT[t0]}, {int(base[4:]) // 8}, {nb}>(ctx, {d}, {m});')
+         return
+-    if base in ('vtrn', 'vzip'):
++    if base in ('vtrn', 'vzip', 'vuzp'):
+         (d, nb, _), (m, _, _) = regs()
+         t = INT[t0]
+         emit(f'{base}<{t}, {lanes(t, nb)}>(ctx, {d}, {m});')
+@@ -212,9 +212,19 @@ def translate(cx):
+         return float_op(cx, base, ops)
+     if base == 'vcvt':
+         (d, nb, _), (m, _, _) = regs()
+-        if len(ops) != 2:
+-            raise Unsupported('vcvt with fraction bits')
+         n = nb // 4
++        if len(ops) == 3 and ops[2].type == arm.ARM_OP_IMM:
++            # fixed point with fraction bits: to fixed rounds towards zero and saturates, from
++            # fixed rounds once (scaling by a power of two is exact), as the scalar forms
++            fix = {('f32', 's32'): ('int32_t', 'float', 'S32FixToF'), ('f32', 'u32'): ('uint32_t', 'float', 'U32FixToF'),
++                   ('s32', 'f32'): ('float', 'int32_t', 'FToS32Fix'), ('u32', 'f32'): ('float', 'uint32_t', 'FToU32Fix')}
++            if (types[0], types[1]) not in fix:
++                raise Unsupported(f'vcvt.{".".join(types)} fixed point')
++            src, dst, f = fix[(types[0], types[1])]
++            emit(f'map1<{src}, {dst}, {n}>(ctx, {d}, {m}, {f}{{{float(2 ** ops[2].imm)!r}}});')
++            return
++        if len(ops) != 2:
++            raise Unsupported('vcvt form')
+         conv = {('f32', 's32'): ('int32_t', 'float', 'S32ToF'), ('f32', 'u32'): ('uint32_t', 'float', 'U32ToF'),
+                 ('s32', 'f32'): ('float', 'int32_t', 'FToS32'), ('u32', 'f32'): ('float', 'uint32_t', 'FToU32')}
+         if (types[0], types[1]) == ('f32', 'f16'):
+@@ -295,7 +305,7 @@ def int_op(cx, base, types, ops):
+     d, nb, _ = rs[0]
+     n = nb // SIZE[t]
+     BIN = {'vadd': 'IAdd', 'vsub': 'ISub', 'vmul': 'IMul', 'vmax': 'IMax', 'vmin': 'IMin', 'vtst': 'ITst',
+-           'vqadd': 'IQAdd', 'vqsub': 'IQSub'}
++           'vqadd': 'IQAdd', 'vqsub': 'IQSub', 'vhadd': 'IHadd', 'vrhadd': 'IRhadd'}
+     CMP = {'vceq': 'ICeq', 'vcge': 'ICge', 'vcgt': 'ICgt'}
+     # vceq.i32 compares bit patterns; vcge/vcgt.sNN/uNN by sign
+     if base in BIN and len(rs) == 3 and imm is None:
+@@ -422,6 +432,36 @@ def load_store(cx, base, t0):
+     esize = SIZE[t]
+     load = base.startswith('vld')
+     structs = int(base[3])  # elements per structure: vld1 .. vld4
++    if structs > 1 and any(s is not None for s in lane_spec):
++        # one n-element structure: element k (at addr + k * esize) to or from one lane of the k-th
++        # listed register (vld4.32 {d16[0], d18[0], d20[0], d22[0]}), or for vldN all lanes
++        # ({d24[], d26[], d28[]}) replicated into the k-th register
++        if len(dregs) != structs:
++            raise Unsupported(f'{base} list {m.group(1)}')
++        total = esize * structs
++        emit('{')
++        emit(f'const uint32_t addr = ctx->r[{rn}];')
++        if all(s == '[]' for s in lane_spec):
++            if not load:
++                raise Unsupported(f'{base} all lanes')
++            for k, dr in enumerate(dregs):
++                emit(f'vdup<{t}, {8 // esize}>(ctx, {dr}, rdT<{t}>(addr + {k * esize}u));')
++        elif all(s and s[1:-1].isdigit() for s in lane_spec):
++            for k, (dr, s) in enumerate(zip(dregs, lane_spec)):
++                lane = int(s[1:-1])
++                if load:
++                    emit(f'vsetlane<{t}>(ctx, {dr}, {lane}, rdT<{t}>(addr + {k * esize}u));')
++                else:
++                    emit(f'wrT<{t}>(addr + {k * esize}u, vlane<{t}>(ctx, {dr}, {lane}));')
++        else:
++            raise Unsupported(f'{base} mixed lanes')
++        if m.group(4):
++            emit(f'ctx->r[{rn}] = addr + {total}u;')
++        elif m.group(5):
++            rm = S.REGS[m.group(5)] if m.group(5) in S.REGS else int(m.group(5)[1:])
++            emit(f'ctx->r[{rn}] = addr + ctx->r[{rm}];')
++        emit('}')
++        return
+     if structs > 1:
+         # multiple n-element structures, interleaved in memory: element e of the structure's
+         # members k = 0 .. n-1 goes to (or comes from) d register list[k * per + r], where the
+diff --git a/recomp/recompile.py b/recomp/recompile.py
+index d624fab..5070ee4 100644
+--- a/recomp/recompile.py
++++ b/recomp/recompile.py
+@@ -30,13 +30,16 @@ namespace armrecomp {{
+ 
+ def translatable(f, mod):
+     """every instruction of f has a translation (NEON and ARM mode included)"""
+-    if f.thumb and not f.uses_neon:
+-        return True  # Thumb integer/VFP code always translates (report.txt counts any exception)
++    if f.thumb and not int(f.row.get('vfp_neon') or 0):
++        return True  # Thumb integer code always translates (report.txt counts any exception)
+     # in Thumb, as above, only a missing vector (v*) translation keeps the function on the fallback
+     # CPU: other unsupported instructions are data decoded as code (a literal pool after a call
+     # that does not return) and become a trap that is never reached
+-    return all(semantics.translate(ins, f.thumb, mod.imports, f.start, f.end, f.jumptables, mod.patched).kind != 'unsupported'
+-               or (f.thumb and not ins.mnemonic.startswith('v'))
++    # the inventory's NEON count misses some forms (vrhadd on d registers), so every Thumb function
++    # with a v* instruction is checked: one with an untranslated vector instruction was emitted
++    # natively with a trap in its place
++    return all((f.thumb and not ins.mnemonic.startswith('v'))
++               or semantics.translate(ins, f.thumb, mod.imports, f.start, f.end, f.jumptables, mod.patched).kind != 'unsupported'
+                for ins in f.instructions)
+ 
+ 
+diff --git a/recomp/runtime/neon.h b/recomp/runtime/neon.h
+index 71e6cf0..525ab1a 100644
+--- a/recomp/runtime/neon.h
++++ b/recomp/runtime/neon.h
+@@ -250,6 +250,25 @@ inline void vtrn(GuestContext *c, unsigned d, unsigned m) {
+     vset(c, m, b);
+ }
+ 
++// vuzp: de-interleave the 2N elements of d:m; the even ones go to d, the odd ones to m
++template <typename T, int N>
++inline void vuzp(GuestContext *c, unsigned d, unsigned m) {
++    const auto a = vget<T, N>(c, d);
++    const auto b = vget<T, N>(c, m);
++    T z[2 * N];
++    for (int i = 0; i < N; i++) {
++        z[i] = a.e[i];
++        z[N + i] = b.e[i];
++    }
++    Vec<T, N> even, odd;
++    for (int i = 0; i < N; i++) {
++        even.e[i] = z[2 * i];
++        odd.e[i] = z[2 * i + 1];
++    }
++    vset(c, d, even);
++    vset(c, m, odd);
++}
++
+ // vzip: interleave d and m; the low half goes to d, the high half to m
+ template <typename T, int N>
+ inline void vzip(GuestContext *c, unsigned d, unsigned m) {
+@@ -340,6 +359,9 @@ struct ICge { template <typename T> T operator()(T a, T b, bool &) const { retur
+ struct ICgt { template <typename T> T operator()(T a, T b, bool &) const { return mask<T>(a > b); } };
+ struct ITst { template <typename T> T operator()(T a, T b, bool &) const { return mask<T>((a & b) != 0); } };
+ 
++// halving adds (8 to 32-bit elements): the sum in 64 bits, then an arithmetic shift (floor)
++struct IHadd { template <typename T> T operator()(T a, T b, bool &) const { return T((int64_t(a) + int64_t(b)) >> 1); } };
++struct IRhadd { template <typename T> T operator()(T a, T b, bool &) const { return T((int64_t(a) + int64_t(b) + 1) >> 1); } };
+ struct IQAdd { template <typename T> T operator()(T a, T b, bool &s) const { return saturate<T>(int64_t(a) + int64_t(b), s); } };
+ struct IQSub { template <typename T> T operator()(T a, T b, bool &s) const { return saturate<T>(int64_t(a) - int64_t(b), s); } };
+ struct IQAbs { template <typename T> T operator()(T a, bool &s) const { return saturate<T>(a < 0 ? -int64_t(a) : int64_t(a), s); } };
+@@ -549,6 +571,36 @@ struct FToU32 {
+     }
+ };
+ struct S32ToF { float operator()(int32_t a, bool &) const { return static_cast<float>(a); } };
++// fixed point with fraction bits (scale = 2^fbits): to fixed rounds towards zero and saturates
++// (NaN -> 0, denormal inputs flushed), from fixed rounds once (the division by 2^fbits is exact)
++struct FToS32Fix {
++    double scale;
++    int32_t operator()(float a, bool &) const {
++        a = nf_in(a);
++        if (a != a)
++            return 0;
++        const double x = double(a) * scale;
++        if (x >= 2147483648.0)
++            return std::numeric_limits<int32_t>::max();
++        if (x <= -2147483648.0)
++            return std::numeric_limits<int32_t>::min();
++        return static_cast<int32_t>(x);
++    }
++};
++struct FToU32Fix {
++    double scale;
++    uint32_t operator()(float a, bool &) const {
++        a = nf_in(a);
++        const double x = double(a) * scale;
++        if (a != a || x <= 0.0)
++            return 0;
++        if (x >= 4294967296.0)
++            return std::numeric_limits<uint32_t>::max();
++        return static_cast<uint32_t>(x);
++    }
++};
++struct S32FixToF { double scale; float operator()(int32_t a, bool &) const { return static_cast<float>(double(a) / scale); } };
++struct U32FixToF { double scale; float operator()(uint32_t a, bool &) const { return static_cast<float>(double(a) / scale); } };
+ struct U32ToF { float operator()(uint32_t a, bool &) const { return static_cast<float>(a); } };
+ // half <-> single precision (vcvt.f32.f16 / vcvt.f16.f32), on the bits, with NEON's standard FPSCR:
+ // default NaN, flush-to-zero (of single inputs; half values are never flushed), round to nearest

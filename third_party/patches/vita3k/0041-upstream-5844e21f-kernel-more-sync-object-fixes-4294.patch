@@ -1,0 +1,1160 @@
+From 27b4974648fba3d700414f34c16f76a6a74877cc Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Fri, 23 Oct 2026 12:54:48 +0900
+Subject: [PATCH 41/52] kernel: more sync object fixes (#4294)
+
+* ci: run the latest VitaAutotests
+
+- Pin VitaAutotests ed71e53, which adds the cases of msgpipe_partial_head_order where two waiters
+  queue behind a partial head.
+- Skip handoff_more. Whether the woken waiter runs before the releaser reads the state is a race
+  while threads ignore their core and priority.
+- Trim the reason of rwlock_requeue_writers. Waiting writers already go before readers, only the
+  requeue on a priority change is missing.
+
+* kernel: fix the counts and arguments of failed cancels
+
+A mutex cancel took -1 as the count the mutex was created with and refused every other negative
+count with ILLEGAL_COUNT. Like on a Vita, every negative count now means the init count, so a
+cancel to -2 or -100 succeeds and resets the mutex to it.
+
+A reader/writer lock cancel took any flag, so one like 2 or -1 woke the waiters and reset the lock.
+It now fails with 0x8002000A and leaves the lock as it was. The flag is checked once the UID names
+an object and before its class, so a semaphore UID gets the flag error and an unknown UID the lookup
+error.
+
+A failed semaphore, mutex or rwlock cancel left the caller's waiter counts as they were. Like on a
+Vita, they now read 0.
+
+mutex_cancel_counts, cancel_calls and rwlock_cancel_order pass. release_errors_waiters now only
+differs when the writer its read unlock wakes runs before the count is read, a race while threads
+ignore their core and priority, so it is skipped.
+
+* kernel: leave 0 in the bits of an event flag poll that fails early
+
+An event flag poll that failed before checking the bits, like one while another thread waits on a
+flag without the multi attribute, left the caller's bits as they were. They now read 0, as a poll
+that gets to check the bits still reports the current ones.
+
+poll_calls passes.
+
+* kernel: take a condition's mutex back as a plain wait on the mutex
+
+A signaled condition waiter that waits to take its mutex back reported the condition's UID in its
+thread info, and took the mutex back with the rest of its timeout, so one that waited for the mutex
+past its deadline gave up with WAIT_TIMEOUT and without the mutex. It now reports the mutex's UID,
+still with the condition relock wait type, and takes the mutex back with no timeout. The waiter
+returns 0 holding the mutex, and the time left stays what it was at the signal.
+
+cond_signal_all_order, cond_semantics and lw_cond_semantics pass, and cond_relock_requeue and
+lw_cond_relock_requeue now only miss the requeue on a priority change.
+
+* kernel: fix what simple event waits and polls write, and waits for pattern 0
+
+A simple event poll that failed left the caller's user data as it was, and a wait that timed out,
+was canceled or saw the event deleted wrote the event's user data. A wait now fills copies that
+start at 0 and go to the guest when it returns, so callbacks that run meanwhile still see the
+guest's own values, and a poll starts from 0. What a failed call doesn't write reads 0, and a
+cancel or a delete still writes the error pattern 0x10.
+
+A wait for pattern 0 failed at once with INVALID_ARGUMENT. It now matches no bit, so it lasts until
+its timeout, a cancel or a delete, and a set or a pulse doesn't end it. A poll for pattern 0 still
+fails with INVALID_ARGUMENT.
+
+simple_event_edges and simple_event_cancel get closer and their reasons are narrowed.
+
+* kernel: implement simple event info, with the attribute and user data it reports
+
+sceKernelGetEventInfo wasn't implemented. It now reports a simple event's UID, name, attribute,
+pattern, user data and waiting thread count, and refuses a size past the struct like the other
+info calls.
+
+A create with attribute 0x800 failed with ILLEGAL_ATTR. It is now accepted and the info reports
+it. Nothing reads it.
+
+A pulse put the user data and the pattern back as they were before it, and a set or pulse of no
+bits still replaced the user data. A pulse now keeps its user data and only clears the bits it
+pulsed after the waiters had them, so the bits an auto reset waiter took stay taken. A set or pulse
+of no bits changes nothing.
+
+simple_event_info passes, and simple_event_edges, simple_event_cancel, simple_event_errors and
+create_attributes get closer and their reasons are narrowed.
+
+* kernel: implement sceKernelCancelEventWithSetPattern
+
+sceKernelCancelEventWithSetPattern wasn't implemented. It now cancels a simple event's waits like
+sceKernelCancelEvent, then replaces the whole pattern, the create event included, and the user data
+with the given ones. A pattern with bits a game may not set fails with ILLEGAL_PATTERN, and the
+count reads 0 when it fails. Its syscall takes the user data and the count pointer through a
+pointer, which libkernel fills on the stack.
+
+simple_event_cancel passes.
+
+* kernel: fix the events of a timer with several waiters
+
+sceKernelGetEventInfo only took simple events, and a timer's event went to its waiters one at a
+time, each checking it once the one before had it. A pulse event was gone by the time the second
+waiter looked, and a set event reached the later waiters only as fast as their threads ran, so a
+cancel right after could still catch them.
+
+A timer UID now reports the timer's name, attribute, waiting thread count and a pattern with the
+create event and, once a set event came, the timer event 0x8000. On a manual reset timer an event
+now ends every wait at once with the timer event, and a waiter whose thread gets the lock back
+after its deadline returns that result. An auto reset timer's events still go to the waiters in
+turn.
+
+timer_event_wakes_all and timer_waiters pass.
+
+* kernel: set a simple event's delete, open and close events
+
+The waits for a simple event's delete event got the event's last user data, an open left the
+pattern alone, and sceKernelCloseSimpleEvent wasn't implemented.
+
+A delete now removes the UID first, under the table lock, so a second delete fails and no later
+call finds the event. Then, under the event's lock, it sets the delete event with the deleting
+thread's UID in the high word of the user data and the process ID in the low word, through the same
+walk as a set, and ends the other waits. So on an auto reset event only the first wait for the
+delete event gets it. The deleting thread's UID goes through `KernelObjects::remove()` to every
+object's `on_delete()`, and only the simple event uses it for now.
+
+An open now sets the open event 0x100 and a close the close event 0x200, each time, with the
+calling thread's user data. The event stays after a close. A close or a delete of an unknown UID
+fails with UNKNOWN_SIMPLE_EVENT_ID, and an open or a close that a delete beats fails like one that
+didn't find the event.
+
+simple_event_edges, simple_event_open_close_bits and simple_event_errors pass.
+
+* kernel: say where a waiter goes behind a head that keeps its place
+
+The comment in WaitQueue::push() only said nothing goes in front of such a head. It now says the
+waiter goes right behind it, so it lands ahead of the waiters already behind that head, whatever
+their priority.
+
+(cherry picked from commit 5844e21fb6d7259a31ba1f13b98ed1a648170052)
+---
+ vita3k/kernel/include/kernel/callback.h       |   2 +-
+ vita3k/kernel/include/kernel/kernel_object.h  |  17 +-
+ vita3k/kernel/include/kernel/state.h          |   5 +-
+ .../kernel/include/kernel/sync_primitives.h   |  45 ++++-
+ .../kernel/include/kernel/thread/wait_queue.h |   3 +-
+ vita3k/kernel/include/kernel/types.h          |  27 ++-
+ vita3k/kernel/src/callback.cpp                |   2 +-
+ vita3k/kernel/src/kernel.cpp                  |   4 +-
+ vita3k/kernel/src/sync_primitives.cpp         | 159 ++++++++++++------
+ vita3k/kernel/src/thread.cpp                  |   4 +-
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 132 +++++++++++----
+ .../modules/SceKernelThreadMgr/SceThreadmgr.h |   2 +
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  |  19 ++-
+ 13 files changed, 308 insertions(+), 113 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/callback.h b/vita3k/kernel/include/kernel/callback.h
+index e4b19efb..881c50ce 100644
+--- a/vita3k/kernel/include/kernel/callback.h
++++ b/vita3k/kernel/include/kernel/callback.h
+@@ -64,7 +64,7 @@ public:
+ 
+ private:
+     // Drops the pending notifications, so the callback never runs again
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     // Clears the notifications and tells the owner if there were any. The lock must be held.
+     void reset();
+ 
+diff --git a/vita3k/kernel/include/kernel/kernel_object.h b/vita3k/kernel/include/kernel/kernel_object.h
+index fa3d46ba..969cba1b 100644
+--- a/vita3k/kernel/include/kernel/kernel_object.h
++++ b/vita3k/kernel/include/kernel/kernel_object.h
+@@ -61,8 +61,8 @@ protected:
+         return guard;
+     }
+ 
+-    // Ends what the object is doing when it is deleted. Runs once, with the lock held.
+-    virtual void on_delete() {}
++    // Ends what the object is doing when the thread deleter deletes it. Runs once, with the lock held.
++    virtual void on_delete(SceUID deleter) {}
+ 
+     // Whether the object was deleted. With the lock held.
+     bool was_deleted() const { return deleted; }
+@@ -70,12 +70,12 @@ protected:
+ private:
+     friend class KernelObjects;
+ 
+-    // Marks the object deleted and runs on_delete().
+-    void mark_deleted() {
++    // Marks the object deleted by the thread deleter and runs on_delete().
++    void mark_deleted(SceUID deleter) {
+         const std::lock_guard<std::mutex> guard(mutex);
+         assert(!deleted);
+         deleted = true;
+-        on_delete();
++        on_delete(deleter);
+     }
+ 
+     mutable std::mutex mutex;
+@@ -124,9 +124,10 @@ public:
+         return std::static_pointer_cast<T>(it->second);
+     }
+ 
+-    // Removes the T with this UID and marks it deleted. Returns false if there is none.
++    // Removes the T with this UID, so no later lookup finds it, then marks it deleted by the thread
++    // deleter. Returns false if there is none.
+     template <KernelObjectClass T>
+-    bool remove(SceUID uid) {
++    bool remove(SceUID uid, SceUID deleter) {
+         std::shared_ptr<KernelObject> obj;
+         {
+             const std::lock_guard<std::mutex> lock(mutex);
+@@ -136,7 +137,7 @@ public:
+             obj = std::move(objects.extract(it).mapped());
+         }
+         // Without the table lock, so lookups never wait for on_delete()
+-        obj->mark_deleted();
++        obj->mark_deleted(deleter);
+         return true;
+     }
+ 
+diff --git a/vita3k/kernel/include/kernel/state.h b/vita3k/kernel/include/kernel/state.h
+index b709a3a5..63a67b39 100644
+--- a/vita3k/kernel/include/kernel/state.h
++++ b/vita3k/kernel/include/kernel/state.h
+@@ -183,8 +183,9 @@ struct KernelState {
+ 
+     // Creates a callback owned by thread and returns its UID.
+     SceUID create_callback(const ThreadStatePtr &thread, const char *name, Ptr<SceKernelCallbackFunction> func, Ptr<void> common);
+-    // Deletes the callback with this UID, so it never runs again. Returns false if there is none.
+-    bool delete_callback(SceUID id);
++    // Deletes the callback with this UID for the thread deleter, so it never runs again. Returns false
++    // if there is none.
++    bool delete_callback(SceUID id, SceUID deleter);
+     Ptr<Ptr<void>> get_thread_tls_addr(MemState &mem, SceUID thread_id, int key);
+ 
+     bool is_threads_paused() {
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index d4e441fc..098a085d 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -139,6 +139,15 @@ protected:
+     }
+ };
+ 
++// The ID of the one process Vita3K runs
++constexpr SceUID PROCESS_ID = 1;
++
++// Returns the user data of a system event a thread caused, like a delete: its UID in the high word
++// and the process ID in the low word.
++constexpr SceUInt64 system_event_user_data(SceUID thread_id) {
++    return (static_cast<SceUInt64>(thread_id) << 32) | static_cast<SceUInt32>(PROCESS_ID);
++}
++
+ class SimpleEvent final : public WithUidClass<SyncPrimitive, UidClass::simple_event> {
+ public:
+     const bool auto_reset;
+@@ -151,10 +160,18 @@ public:
+     SceInt32 wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks);
+     SceInt32 poll(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
+     SceInt32 set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set);
++    // Sets one of the system events, like the open event, with user_data for its waiters, or returns
++    // UNKNOWN_EVENT_ID if it was deleted.
++    SceInt32 set_system_event(SceUInt32 event, SceUInt64 user_data);
+     SceInt32 clear(SceUInt32 clear_pattern);
+     SceInt32 cancel(SceUInt32 *num_wait_threads);
++    // Cancels the waits like cancel(), then replaces the whole pattern and the user data.
++    SceInt32 cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *num_wait_threads);
+     // Sets result to the event's bit pattern, or returns UNKNOWN_EVENT_ID if it was deleted.
+     SceInt32 get_pattern(SceUInt32 &result) const;
++    // Fills info with what the simple event's info reports, or returns UNKNOWN_EVENT_ID if it was
++    // deleted.
++    SceInt32 info(SceKernelEventInfo &info) const;
+ 
+ private:
+     struct WaitEntry {
+@@ -163,9 +180,12 @@ private:
+         SceUInt64 *user_data;
+     };
+ 
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     // Takes the event if wait_pattern matches, or returns SCE_KERNEL_ERROR_EVENT_COND. The lock must be held.
+     SceInt32 try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
++    // Sets or pulses the bits with user_data and gives them to the waits they match. The lock must be
++    // held.
++    void fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set);
+     // Gives the event's bits to the waits they match.
+     void serve() override;
+ 
+@@ -195,9 +215,16 @@ public:
+     // Sets time to the clock time the count runs from, 0 if the timer never started, or returns
+     // UNKNOWN_TIMER_ID if it was deleted.
+     SceInt32 get_base(uint64_t &time) const;
++    // Fills info with what the event info of the timer reports, or returns UNKNOWN_EVENT_ID if it was
++    // deleted.
++    SceInt32 event_info(SceKernelEventInfo &info) const;
+ 
+ private:
+-    void on_delete() override;
++    struct WaitEntry {
++        SceUInt32 *result_pattern;
++    };
++
++    void on_delete(SceUID deleter) override;
+     void schedule_event();
+     // Wakes the first waiter so it checks the event again
+     void wake_first();
+@@ -210,7 +237,7 @@ private:
+ 
+     // Guarded by the lock
+     // Only the first waiter waits for the next event, the others wait for their turn
+-    WaitQueue<std::monostate> waiters;
++    WaitQueue<WaitEntry> waiters;
+ 
+     bool is_started = false;
+     bool is_repeat = false;
+@@ -248,7 +275,7 @@ private:
+         SceInt32 need_count;
+     };
+ 
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     // Takes need_count if the count covers it and no waiter is queued ahead of thread. The lock
+     // must be held.
+     bool try_take(const ThreadStatePtr &thread, SceInt32 need_count);
+@@ -294,7 +321,7 @@ protected:
+     SceUID owner;
+ 
+ private:
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     bool lightweight() const { return get_uid_class() == UidClass::lw_mutex; }
+     // Returns ILLEGAL_COUNT for a lock or unlock count the mutex can't take, or SCE_KERNEL_OK
+     SceInt32 check_count(SceInt32 count) const;
+@@ -350,7 +377,7 @@ private:
+         bool is_write;
+     };
+ 
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     SceInt32 acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32 *timeout, bool callbacks);
+     SceInt32 try_acquire(const ThreadStatePtr &thread, bool is_write);
+     SceInt32 release(const ThreadStatePtr &thread, bool is_write);
+@@ -400,7 +427,7 @@ private:
+         SceUInt32 *out_bits;
+     };
+ 
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     // Returns whether another thread's wait holds the flag. The lock must be held.
+     bool held_by_other(SceUID thread_id) const;
+     // Takes the flags for the thread if pattern matches them, or returns why it can't. The lock must
+@@ -461,7 +488,7 @@ protected:
+     WaitQueue<std::monostate> waiters;
+ 
+ private:
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     bool lightweight() const { return get_uid_class() == UidClass::lw_cond; }
+ };
+ 
+@@ -549,7 +576,7 @@ private:
+         Receiver(MemState &mem, std::span<const MsgPipeVector> pieces, SceSize *size, SceSize total, bool full, bool peek);
+     };
+ 
+-    void on_delete() override;
++    void on_delete(SceUID deleter) override;
+     // Carries on the first receiver's and the first sender's transfers until neither ends
+     void serve() override;
+     // Moves the sender's bytes to the waiting receivers, then puts the rest into the pipe. Returns
+diff --git a/vita3k/kernel/include/kernel/thread/wait_queue.h b/vita3k/kernel/include/kernel/thread/wait_queue.h
+index e4ac6831..458dcd18 100644
+--- a/vita3k/kernel/include/kernel/thread/wait_queue.h
++++ b/vita3k/kernel/include/kernel/thread/wait_queue.h
+@@ -156,7 +156,8 @@ public:
+         if (by_priority) {
+             // Lower value is higher priority, equal priorities keep FIFO order
+             pos = std::find_if(waiters.begin(), waiters.end(), [&](const Waiter *w) { return w->priority > waiter.priority; });
+-            // Nothing goes in front of a head that keeps its place
++            // A waiter whose place is the front goes right behind a head that keeps its place, so
++            // it lands ahead of the waiters already behind that head, whatever their priority
+             if (pos == waiters.begin() && pos != waiters.end() && keeps_place((*pos)->entry))
+                 ++pos;
+         }
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index 051d616a..6069baaa 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -58,11 +58,13 @@
+ #define SCE_KERNEL_EVENT_ATTR_MANUAL_RESET 0x00000000U
+ #define SCE_KERNEL_EVENT_ATTR_AUTO_RESET 0x00000100U
+ 
+-// System events of a simple event: set when it is created, reported to waits for it when it is
+-// deleted, and the result of a wait that ends with an error
++// System events of a simple event: set when it is created, deleted, opened and closed, and the
++// result of a wait that ends with an error
+ #define SCE_KERNEL_EVENT_CREATE 0x00000004U
+ #define SCE_KERNEL_EVENT_DELETE 0x00000008U
+ #define SCE_KERNEL_EVENT_ERROR 0x00000010U
++#define SCE_KERNEL_EVENT_OPEN 0x00000100U
++#define SCE_KERNEL_EVENT_CLOSE 0x00000200U
+ // The bits of a simple event a game may set and clear, the others are system events
+ #define SCE_KERNEL_EVENT_USER_DEFINED_MASK 0xFF000000U
+ 
+@@ -813,6 +815,14 @@ struct SceKernelCreateSema_opt {
+     Ptr<SceKernelSemaOptParam> option;
+ };
+ 
++// The arguments of sceKernelCancelEventWithSetPattern after the pattern, which its syscall takes
++// through a pointer
++struct SceKernelCancelEventWithSetPattern_opt {
++    SceUInt64 userData;
++    Ptr<SceUInt32> pNumWaitThreads;
++};
++static_assert(sizeof(SceKernelCancelEventWithSetPattern_opt) == 0x10, "Incorrect size");
++
+ struct SceKernelCreateMsgPipeOpt {
+     /** Size of the structure */
+     SceSize size;
+@@ -866,6 +876,19 @@ struct SceKernelEventFlagInfo {
+     SceUInt32 numWaitThreads;
+ };
+ 
++// What sceKernelGetEventInfo reports
++struct SceKernelEventInfo {
++    SceSize size;
++    SceUID eventId;
++    char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
++    SceUInt32 attr;
++    SceUInt32 eventPattern;
++    SceUInt64 userData;
++    SceUInt32 numWaitThreads;
++    SceInt32 reserved;
++};
++static_assert(sizeof(SceKernelEventInfo) == 0x40, "Incorrect size");
++
+ struct SceKernelMutexInfo {
+     SceSize size;
+     SceUID mutexId;
+diff --git a/vita3k/kernel/src/callback.cpp b/vita3k/kernel/src/callback.cpp
+index 4af3b9c3..b4813187 100644
+--- a/vita3k/kernel/src/callback.cpp
++++ b/vita3k/kernel/src/callback.cpp
+@@ -54,7 +54,7 @@ void Callback::cancel() {
+         this->reset();
+ }
+ 
+-void Callback::on_delete() {
++void Callback::on_delete(SceUID) {
+     this->reset();
+ }
+ 
+diff --git a/vita3k/kernel/src/kernel.cpp b/vita3k/kernel/src/kernel.cpp
+index 45dbaa43..373a0528 100644
+--- a/vita3k/kernel/src/kernel.cpp
++++ b/vita3k/kernel/src/kernel.cpp
+@@ -172,8 +172,8 @@ SceUID KernelState::create_callback(const ThreadStatePtr &thread, const char *na
+     return uid;
+ }
+ 
+-bool KernelState::delete_callback(SceUID id) {
+-    return objects.remove<Callback>(id);
++bool KernelState::delete_callback(SceUID id, SceUID deleter) {
++    return objects.remove<Callback>(id, deleter);
+ }
+ 
+ ThreadStatePtr KernelState::create_thread(MemState &mem, const char *name, Ptr<const void> entry_point) {
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 8c2dfe8c..3880fe23 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -50,37 +50,23 @@ SimpleEvent::SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_patter
+ SceInt32 SimpleEvent::check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern) {
+     if (const SceInt32 error = check_name(name, attr))
+         return error;
+-    if (attr & ~(SCE_KERNEL_EVENT_ATTR_AUTO_RESET | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE))
++    // The notify attribute is accepted and reported, nothing reads it
++    if (attr & ~(SCE_KERNEL_EVENT_ATTR_AUTO_RESET | SCE_KERNEL_ATTR_TH_PRIO | SCE_KERNEL_ATTR_OPENABLE | SCE_KERNEL_ATTR_NOTIFY_CB_WAKEUP_ONLY))
+         return SCE_KERNEL_ERROR_ILLEGAL_ATTR;
+     if (init_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
+         return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
+     return SCE_KERNEL_OK;
+ }
+ 
+-void SimpleEvent::on_delete() {
+-    // Waits for the delete event end with it, the others with an error
+-    waiters.wake_if([&](auto &waiter) {
+-        const WaitEntry &wait = waiter.entry;
+-        if (!(wait.pattern & SCE_KERNEL_EVENT_DELETE))
+-            return false;
+-
+-        if (wait.result_pattern)
+-            *wait.result_pattern = (pattern | SCE_KERNEL_EVENT_DELETE) & wait.pattern;
+-
+-        if (wait.user_data)
+-            *wait.user_data = last_user_data;
+-
+-        return true;
+-    });
++void SimpleEvent::on_delete(SceUID deleter) {
++    // The waits for the delete event get it with the deleting thread's user data, then the others end
++    fire(SCE_KERNEL_EVENT_DELETE, system_event_user_data(deleter), true);
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+ SceInt32 SimpleEvent::try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
+-    if (!(pattern & wait_pattern)) {
+-        if (result_pattern)
+-            *result_pattern = 0;
++    if (!(pattern & wait_pattern))
+         return SCE_KERNEL_ERROR_EVENT_COND;
+-    }
+ 
+     if (result_pattern)
+         *result_pattern = pattern & wait_pattern;
+@@ -99,22 +85,19 @@ SceInt32 SimpleEvent::wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern,
+     auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+-    if (wait_pattern == 0)
+-        return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+     if (const WaitResult r = run_pending_callbacks(guard, thread, callbacks); !r || *r != SCE_KERNEL_OK)
+         return guest_result(r);
+ 
++    // A wait for pattern 0 matches nothing, so it lasts until its timeout, a cancel or a delete
+     if (const SceInt32 result = try_take(wait_pattern, result_pattern, user_data); result != SCE_KERNEL_ERROR_EVENT_COND)
+         return result;
+ 
+     const WaitResult r = wait_on(waiters, guard, thread, { SCE_KERNEL_WAITTYPE_EVENT, uid, callbacks }, { wait_pattern, result_pattern, user_data }, timeout);
+     const SceInt32 err = guest_result(r);
+-    // A timed out wait keeps the 0 try_take wrote, one ended by a delete or a cancel gets the error
+-    // event, and set_or_pulse or on_delete writes the bits of one that succeeds
++    // A wait ended by a delete or a cancel gets the error event and no user data, and set_or_pulse
++    // or on_delete writes what one that succeeds gets
+     if (err < 0 && err != SCE_KERNEL_ERROR_WAIT_TIMEOUT && result_pattern)
+         *result_pattern = SCE_KERNEL_EVENT_ERROR;
+-    if (err < 0 && user_data)
+-        *user_data = last_user_data;
+     return err;
+ }
+ 
+@@ -135,19 +118,31 @@ SceInt32 SimpleEvent::set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, b
+     if (set_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
+         return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
+ 
+-    const SceUInt32 old_pattern = pattern;
+-    const SceUInt64 old_user_data = last_user_data;
++    fire(set_pattern, user_data, is_set);
++    return SCE_KERNEL_OK;
++}
++
++SceInt32 SimpleEvent::set_system_event(SceUInt32 event, SceUInt64 user_data) {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    fire(event, user_data, true);
++    return SCE_KERNEL_OK;
++}
++
++void SimpleEvent::fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set) {
++    // A set or pulse of no bits changes nothing, not even the user data
++    if (set_pattern == 0)
++        return;
++
+     pattern |= set_pattern;
+     last_user_data = user_data;
+     serve();
+ 
+-    // A pulse clears its own bits, the others go back to what they were
+-    if (!is_set) {
+-        pattern = old_pattern & ~set_pattern;
+-        last_user_data = old_user_data;
+-    }
+-
+-    return SCE_KERNEL_OK;
++    // A pulse clears its bits once the waiters had them, also the ones set before it, and keeps its
++    // user data
++    if (!is_set)
++        pattern &= ~set_pattern;
+ }
+ 
+ void SimpleEvent::serve() {
+@@ -194,6 +189,23 @@ SceInt32 SimpleEvent::cancel(SceUInt32 *num_wait_threads) {
+     return SCE_KERNEL_OK;
+ }
+ 
++SceInt32 SimpleEvent::cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *num_wait_threads) {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    if (set_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
++        return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
++
++    const auto nb_threads = static_cast<SceUInt32>(waiters.wake_all(SCE_KERNEL_ERROR_WAIT_CANCEL));
++    // Every bit is replaced, the create event too, and no waiter is left to get them
++    pattern = set_pattern;
++    last_user_data = user_data;
++    if (num_wait_threads)
++        *num_wait_threads = nb_threads;
++
++    return SCE_KERNEL_OK;
++}
++
+ SceInt32 SimpleEvent::get_pattern(SceUInt32 &result) const {
+     const auto guard = lock();
+     if (!guard)
+@@ -202,6 +214,21 @@ SceInt32 SimpleEvent::get_pattern(SceUInt32 &result) const {
+     return SCE_KERNEL_OK;
+ }
+ 
++SceInt32 SimpleEvent::info(SceKernelEventInfo &info) const {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++
++    info = {};
++    info.eventId = uid;
++    strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
++    info.attr = attr;
++    info.eventPattern = pattern;
++    info.userData = last_user_data;
++    info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
++    return SCE_KERNEL_OK;
++}
++
+ // *********
+ // * Timer *
+ // *********
+@@ -216,7 +243,7 @@ Timer::Timer(SceUInt32 attr, const char *name)
+     : WithUidClass(attr, name)
+     , waiters(attr) {}
+ 
+-void Timer::on_delete() {
++void Timer::on_delete(SceUID) {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+@@ -228,7 +255,7 @@ void Timer::schedule_event() {
+ }
+ 
+ void Timer::wake_first() {
+-    if (WaitQueue<std::monostate>::Waiter *const first = waiters.front())
++    if (WaitQueue<WaitEntry>::Waiter *const first = waiters.front())
+         first->thread->wake();
+ }
+ 
+@@ -297,7 +324,7 @@ SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, Sc
+         return result;
+ 
+     const Deadline guest_deadline = deadline_from(timeout);
+-    WaitQueue<std::monostate>::Waiter waiter{ .thread = thread, .priority = thread->get_priority() };
++    WaitQueue<WaitEntry>::Waiter waiter{ .thread = thread, .priority = thread->get_priority(), .entry = { result_pattern } };
+     waiters.push(waiter);
+ 
+     while (true) {
+@@ -319,6 +346,12 @@ SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, Sc
+         if (r && *r == SCE_KERNEL_ERROR_NOTIFY_CALLBACK)
+             r = thread->run_callbacks();
+         guard.lock();
++        // A waker that ended the wait meanwhile, like an event that reached every waiter at once,
++        // wins over the deadline and the thread's end
++        if (waiter.result) {
++            writeback_timeout(timeout, guest_deadline);
++            return *waiter.result;
++        }
+         if (!r) {
+             waiters.remove(waiter);
+             wake_first();
+@@ -343,6 +376,15 @@ SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, Sc
+     if (result_pattern)
+         *result_pattern = SCE_KERNEL_EVENT_TIMER;
+ 
++    // An event of a manual reset timer reaches every waiter at once, the events of an auto reset one
++    // go to the waiters in turn
++    if (!(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)) {
++        waiters.wake_if([](auto &w) {
++            if (w.entry.result_pattern)
++                *w.entry.result_pattern = SCE_KERNEL_EVENT_TIMER;
++            return true;
++        });
++    }
+     event_set = !is_pulse && !(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET);
+     advance_next_event(current_time);
+     // the next waiter checks the event in turn
+@@ -434,6 +476,22 @@ SceInt32 Timer::get_base(uint64_t &time) const {
+     return SCE_KERNEL_OK;
+ }
+ 
++SceInt32 Timer::event_info(SceKernelEventInfo &info) const {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++
++    // A set event that came is set, also before a wait or a poll took it
++    const bool fired = event_set || (!is_pulse && next_event < get_current_time());
++    info = {};
++    info.eventId = uid;
++    strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
++    info.attr = attr;
++    info.eventPattern = SCE_KERNEL_EVENT_CREATE | (fired ? SCE_KERNEL_EVENT_TIMER : 0);
++    info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
++    return SCE_KERNEL_OK;
++}
++
+ SceInt32 Timer::cancel(SceUInt32 *num_wait_threads) {
+     const auto guard = lock();
+     if (!guard)
+@@ -481,7 +539,7 @@ SceInt32 Mutex::check_count(SceInt32 count) const {
+     return SCE_KERNEL_OK;
+ }
+ 
+-void Mutex::on_delete() {
++void Mutex::on_delete(SceUID) {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+     owner = 0;
+ }
+@@ -619,10 +677,10 @@ SceInt32 Mutex::cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt
+     if (!guard)
+         return lightweight() ? SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID : SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID;
+ 
+-    // -1 restores the lock count the mutex was created with
+-    if (new_count == -1)
++    // Any negative count restores the lock count the mutex was created with
++    if (new_count < 0)
+         new_count = init_count;
+-    if (new_count < 0 || (new_count > 1 && !(attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE)))
++    if (new_count > 1 && !(attr & SCE_KERNEL_MUTEX_ATTR_RECURSIVE))
+         return SCE_KERNEL_ERROR_ILLEGAL_COUNT;
+ 
+     const auto nb_threads = static_cast<SceUInt32>(waiters.wake_all(SCE_KERNEL_ERROR_WAIT_CANCEL));
+@@ -683,7 +741,7 @@ SceInt32 RWLock::check_create(const char *name, SceUInt32 attr) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-void RWLock::on_delete() {
++void RWLock::on_delete(SceUID) {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+@@ -873,7 +931,7 @@ SceInt32 Semaphore::check_create(const char *name, SceUInt32 attr, SceInt32 init
+     return SCE_KERNEL_OK;
+ }
+ 
+-void Semaphore::on_delete() {
++void Semaphore::on_delete(SceUID) {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+@@ -980,7 +1038,7 @@ Condvar::Condvar(SceUInt32 attr, const char *name, MutexPtr associated_mutex)
+     , associated_mutex(std::move(associated_mutex))
+     , waiters(attr) {}
+ 
+-void Condvar::on_delete() {
++void Condvar::on_delete(SceUID) {
+     waiters.wake_all(lightweight() ? SCE_KERNEL_ERROR_WAIT_DELETE_LW_COND : SCE_KERNEL_ERROR_WAIT_DELETE_COND);
+ }
+ 
+@@ -998,14 +1056,15 @@ SceInt32 Condvar::wait(MemState &mem, const ThreadStatePtr &thread, SceUInt32 *t
+     // Deleted while the waiter ran its callbacks out of the queue, which ends it like the delete's wake
+     if (r && *r == SCE_KERNEL_ERROR_WAIT_DELETE)
+         return lightweight() ? SCE_KERNEL_ERROR_WAIT_DELETE_LW_COND : SCE_KERNEL_ERROR_WAIT_DELETE_COND;
+-    // A timed out wait still takes the mutex back, as long as that takes
++    // A timed out wait still takes the mutex back
+     const bool timed_out = r && *r == SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+     if (!r || (*r != SCE_KERNEL_OK && !timed_out))
+         return guest_result(r);
+ 
+     guard.unlock();
+-    // Taking the mutex back is still part of the condition variable wait
+-    const SceInt32 result = associated_mutex->acquire(mem, thread, 1, timed_out ? nullptr : timeout, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX : SCE_KERNEL_WAITTYPE_COND_MUTEX, uid, callbacks });
++    // Taking the mutex back is still part of the condition variable wait, a wait on the mutex with no
++    // timeout that leaves the time left as it was at the signal
++    const SceInt32 result = associated_mutex->acquire(mem, thread, 1, nullptr, { lightweight() ? SCE_KERNEL_WAITTYPE_LW_COND_LW_MUTEX : SCE_KERNEL_WAITTYPE_COND_MUTEX, associated_mutex->uid, callbacks });
+     if (timed_out && result == SCE_KERNEL_OK)
+         return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+     // Report a wait ended by the mutex with the mutex error codes, also when the mutex was deleted
+@@ -1108,7 +1167,7 @@ SceInt32 EventFlag::check_wait(SceUInt32 pattern, SceUInt32 wait_mode) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-void EventFlag::on_delete() {
++void EventFlag::on_delete(SceUID) {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+     holder = 0;
+     holds = 0;
+@@ -1320,7 +1379,7 @@ static bool is_msg_pipe_mode(SceUInt32 wait_mode) {
+     return !(wait_mode & ~(SCE_KERNEL_MSG_PIPE_MODE_FULL | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT | SCE_KERNEL_MSG_PIPE_MODE_DONT_REMOVE));
+ }
+ 
+-void MsgPipe::on_delete() {
++void MsgPipe::on_delete(SceUID) {
+     // Wake up every thread
+     senders.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+     receivers.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+diff --git a/vita3k/kernel/src/thread.cpp b/vita3k/kernel/src/thread.cpp
+index c15b1dad..d7965e60 100644
+--- a/vita3k/kernel/src/thread.cpp
++++ b/vita3k/kernel/src/thread.cpp
+@@ -246,7 +246,7 @@ void ThreadState::run_loop(bool top_level) {
+         lock.unlock();
+         for (const auto &weak_cb : callbacks) {
+             if (const CallbackPtr cb = weak_cb.lock())
+-                kernel.delete_callback(cb->uid);
++                kernel.delete_callback(cb->uid, id);
+         }
+         callbacks.clear();
+         lock.lock();
+@@ -639,7 +639,7 @@ SceUInt32 ThreadState::process_callbacks() {
+         }
+         // A callback that returns nonzero deletes itself
+         if (ret != 0)
+-            kernel.delete_callback(cb->uid);
++            kernel.delete_callback(cb->uid, id);
+     }
+     const std::lock_guard<std::mutex> lock(mutex);
+     is_processing_callbacks = false;
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 90ca2a20..887baff2 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -54,14 +54,25 @@ static void write_info(T *info, T full, SceSize size) {
+ 
+ // Waits on a simple event or a timer, which are both events.
+ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
++    // The wait fills copies that start at 0 and go to the guest when it returns, so the values a wait
++    // doesn't write read 0, and callbacks run meanwhile see the guest's own
++    SceUInt32 pattern = 0;
++    SceUInt64 data = 0;
++    SceUInt32 *const pattern_copy = result_pattern ? &pattern : nullptr;
++    SceUInt64 *const data_copy = user_data ? &data : nullptr;
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+-    const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id);
+-    const TimerPtr timer = event ? nullptr : emuenv.kernel.objects.find<Timer>(event_id);
+-    if (!event && !timer)
+-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+-    if (event)
+-        return event->wait(thread, bit_pattern, result_pattern, user_data, timeout, callbacks);
+-    return timer->wait(thread, result_pattern, user_data, timeout, callbacks);
++    SceInt32 result;
++    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
++        result = event->wait(thread, bit_pattern, pattern_copy, data_copy, timeout, callbacks);
++    else if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(event_id))
++        result = timer->wait(thread, pattern_copy, data_copy, timeout, callbacks);
++    else
++        result = RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    if (result_pattern)
++        *result_pattern = pattern;
++    if (user_data)
++        *user_data = data;
++    return result;
+ }
+ 
+ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const char *name, unsigned int attr, Ptr<SceKernelCreateLwMutex_opt> opt) {
+@@ -105,9 +116,19 @@ EXPORT(SceInt32, _sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, Sc
+     return event->cancel(pattern, num_wait_thread);
+ }
+ 
+-EXPORT(int, _sceKernelCancelEventWithSetPattern) {
+-    TRACY_FUNC(_sceKernelCancelEventWithSetPattern);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelCancelEventWithSetPattern, SceUID eventId, SceUInt32 setPattern, Ptr<SceKernelCancelEventWithSetPattern_opt> pOpt) {
++    TRACY_FUNC(_sceKernelCancelEventWithSetPattern, eventId, setPattern, pOpt);
++    const SceKernelCancelEventWithSetPattern_opt *opt = pOpt.get(emuenv.mem);
++    if (!opt)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    SceUInt32 *num_wait_threads = opt->pNumWaitThreads.get(emuenv.mem);
++    // The count reads 0 if the cancel fails
++    if (num_wait_threads)
++        *num_wait_threads = 0;
++    const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(eventId);
++    if (!event)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    return event->cancel(setPattern, opt->userData, num_wait_threads);
+ }
+ 
+ EXPORT(SceInt32, _sceKernelCancelMsgPipe, SceUID msgPipeId, SceUInt32 *pNumSendWaitThreads, SceUInt32 *pNumReceiveWaitThreads) {
+@@ -120,6 +141,9 @@ EXPORT(SceInt32, _sceKernelCancelMsgPipe, SceUID msgPipeId, SceUInt32 *pNumSendW
+ 
+ EXPORT(SceInt32, _sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads) {
+     TRACY_FUNC(_sceKernelCancelMutex, mutexId, newCount, pNumWaitThreads);
++    // The count reads 0 if the cancel fails
++    if (pNumWaitThreads)
++        *pNumWaitThreads = 0;
+     const MutexPtr mutex = emuenv.kernel.objects.find<HeavyMutex>(mutexId);
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
+@@ -128,6 +152,17 @@ EXPORT(SceInt32, _sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUI
+ 
+ EXPORT(SceInt32, _sceKernelCancelRWLock, SceUID rwLockId, SceUInt32 *pNumReadWaitThreads, SceUInt32 *pNumWriteWaitThreads, SceInt32 flag) {
+     TRACY_FUNC(_sceKernelCancelRWLock, rwLockId, pNumReadWaitThreads, pNumWriteWaitThreads, flag);
++    // The counts read 0 if the cancel fails
++    if (pNumReadWaitThreads)
++        *pNumReadWaitThreads = 0;
++    if (pNumWriteWaitThreads)
++        *pNumWriteWaitThreads = 0;
++    // The flag is checked once the UID names an object, before its class is
++    if (!emuenv.kernel.objects.find(rwLockId))
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
++    // Only 0 and 1 are flags, compared as unsigned
++    if (static_cast<SceUInt32>(flag) > SCE_KERNEL_RW_LOCK_CANCEL_WITH_WRITE_LOCK)
++        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_FLAGS);
+     const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(rwLockId);
+     if (!rwlock)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
+@@ -136,6 +171,9 @@ EXPORT(SceInt32, _sceKernelCancelRWLock, SceUID rwLockId, SceUInt32 *pNumReadWai
+ 
+ EXPORT(int, _sceKernelCancelSema, SceUID semaId, SceInt32 setCount, SceUInt32 *pNumWaitThreads) {
+     TRACY_FUNC(_sceKernelCancelSema, semaId, setCount, pNumWaitThreads);
++    // The count reads 0 if the cancel fails
++    if (pNumWaitThreads)
++        *pNumWaitThreads = 0;
+     const SemaphorePtr semaphore = emuenv.kernel.objects.find<Semaphore>(semaId);
+     if (!semaphore)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
+@@ -249,7 +287,7 @@ EXPORT(int, _sceKernelDeleteLwCond, Ptr<SceKernelLwCondWork> workarea) {
+     TRACY_FUNC(_sceKernelDeleteLwCond, workarea);
+     SceUID lightweight_condition_id = workarea.get(emuenv.mem)->uid;
+ 
+-    if (!emuenv.kernel.objects.remove<LwCond>(lightweight_condition_id))
++    if (!emuenv.kernel.objects.remove<LwCond>(lightweight_condition_id, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
+ 
+     workarea.get(emuenv.mem)->uid = SCE_UID_INVALID_UID;
+@@ -264,7 +302,7 @@ EXPORT(int, _sceKernelDeleteLwMutex, Ptr<SceKernelLwMutexWork> workarea) {
+ 
+     const auto lightweight_mutex_id = workarea.get(emuenv.mem)->uid;
+ 
+-    if (!emuenv.kernel.objects.remove<LwMutex>(lightweight_mutex_id))
++    if (!emuenv.kernel.objects.remove<LwMutex>(lightweight_mutex_id, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -341,9 +379,28 @@ EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFla
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, _sceKernelGetEventInfo) {
+-    TRACY_FUNC(_sceKernelGetEventInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetEventInfo, SceUID eventId, Ptr<SceKernelEventInfo> pInfo) {
++    TRACY_FUNC(_sceKernelGetEventInfo, eventId, pInfo);
++    // A timer is an event too
++    SceKernelEventInfo full;
++    SceInt32 found = SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(eventId))
++        found = event->info(full);
++    else if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(eventId))
++        found = timer->event_info(full);
++    if (found != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++
++    SceKernelEventInfo *info = pInfo.get(emuenv.mem);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++
++    if (info->size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++
++    write_info(info, full);
++
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(SceInt32, _sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_pattern) {
+@@ -710,6 +767,11 @@ EXPORT(int, _sceKernelPMonThreadGetCounter) {
+ 
+ EXPORT(int, _sceKernelPollEvent, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
+     TRACY_FUNC(_sceKernelPollEvent, event_id, bit_pattern, result_pattern, user_data);
++    // The values a poll doesn't write read 0
++    if (result_pattern)
++        *result_pattern = 0;
++    if (user_data)
++        *user_data = 0;
+     if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
+         return event->poll(bit_pattern, result_pattern, user_data);
+     // this may also be a timer event
+@@ -720,6 +782,9 @@ EXPORT(int, _sceKernelPollEvent, SceUID event_id, SceUInt32 bit_pattern, SceUInt
+ 
+ EXPORT(int, _sceKernelPollEventFlag, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits) {
+     TRACY_FUNC(_sceKernelPollEventFlag, event_id, flags, wait, outBits);
++    // The bits read 0 unless the poll gets to check them
++    if (outBits)
++        *outBits = 0;
+     const EventFlagPtr event = emuenv.kernel.objects.find<EventFlag>(event_id);
+     if (!event)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+@@ -1144,9 +1209,15 @@ EXPORT(int, sceKernelCloseSema) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, sceKernelCloseSimpleEvent) {
+-    TRACY_FUNC(sceKernelCloseSimpleEvent);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelCloseSimpleEvent, SceUID event_id) {
++    TRACY_FUNC(sceKernelCloseSimpleEvent, event_id);
++    const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id);
++    if (!event)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SIMPLE_EVENT_ID);
++    // The event stays, only the close event tells its waiters. A delete that came first wins.
++    if (event->set_system_event(SCE_KERNEL_EVENT_CLOSE, system_event_user_data(thread_id)) != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SIMPLE_EVENT_ID);
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, sceKernelCloseTimer) {
+@@ -1241,14 +1312,14 @@ EXPORT(int, sceKernelDelayThreadCB200, SceUInt delay) {
+ 
+ EXPORT(int, sceKernelDeleteCallback, SceUID callbackId) {
+     TRACY_FUNC(sceKernelDeleteCallback, callbackId);
+-    if (!emuenv.kernel.delete_callback(callbackId))
++    if (!emuenv.kernel.delete_callback(callbackId, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_CALLBACK_ID);
+     return 0;
+ }
+ 
+ EXPORT(int, sceKernelDeleteCond, SceUID condition_variable_id) {
+     TRACY_FUNC(sceKernelDeleteCond, condition_variable_id);
+-    if (!emuenv.kernel.objects.remove<HeavyCond>(condition_variable_id))
++    if (!emuenv.kernel.objects.remove<HeavyCond>(condition_variable_id, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_COND_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1256,7 +1327,7 @@ EXPORT(int, sceKernelDeleteCond, SceUID condition_variable_id) {
+ 
+ EXPORT(int, sceKernelDeleteEventFlag, SceUID event_id) {
+     TRACY_FUNC(sceKernelDeleteEventFlag, event_id);
+-    if (!emuenv.kernel.objects.remove<EventFlag>(event_id))
++    if (!emuenv.kernel.objects.remove<EventFlag>(event_id, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVF_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1264,7 +1335,7 @@ EXPORT(int, sceKernelDeleteEventFlag, SceUID event_id) {
+ 
+ EXPORT(SceInt32, sceKernelDeleteMsgPipe, SceUID msgPipeId) {
+     TRACY_FUNC(sceKernelDeleteMsgPipe, msgPipeId);
+-    if (!emuenv.kernel.objects.remove<MsgPipe>(msgPipeId))
++    if (!emuenv.kernel.objects.remove<MsgPipe>(msgPipeId, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1272,7 +1343,7 @@ EXPORT(SceInt32, sceKernelDeleteMsgPipe, SceUID msgPipeId) {
+ 
+ EXPORT(int, sceKernelDeleteMutex, SceUID mutexid) {
+     TRACY_FUNC(sceKernelDeleteMutex, mutexid);
+-    if (!emuenv.kernel.objects.remove<HeavyMutex>(mutexid))
++    if (!emuenv.kernel.objects.remove<HeavyMutex>(mutexid, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MUTEX_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1280,7 +1351,7 @@ EXPORT(int, sceKernelDeleteMutex, SceUID mutexid) {
+ 
+ EXPORT(SceInt32, sceKernelDeleteRWLock, SceUID lock_id) {
+     TRACY_FUNC(sceKernelDeleteRWLock, lock_id);
+-    if (!emuenv.kernel.objects.remove<RWLock>(lock_id))
++    if (!emuenv.kernel.objects.remove<RWLock>(lock_id, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1288,7 +1359,7 @@ EXPORT(SceInt32, sceKernelDeleteRWLock, SceUID lock_id) {
+ 
+ EXPORT(int, sceKernelDeleteSema, SceUID semaid) {
+     TRACY_FUNC(sceKernelDeleteSema, semaid);
+-    if (!emuenv.kernel.objects.remove<Semaphore>(semaid))
++    if (!emuenv.kernel.objects.remove<Semaphore>(semaid, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SEMA_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1296,8 +1367,8 @@ EXPORT(int, sceKernelDeleteSema, SceUID semaid) {
+ 
+ EXPORT(int, sceKernelDeleteSimpleEvent, SceUID event_id) {
+     TRACY_FUNC(sceKernelDeleteSimpleEvent, event_id);
+-    if (!emuenv.kernel.objects.remove<SimpleEvent>(event_id))
+-        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    if (!emuenv.kernel.objects.remove<SimpleEvent>(event_id, thread_id))
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_SIMPLE_EVENT_ID);
+ 
+     return SCE_KERNEL_OK;
+ }
+@@ -1317,7 +1388,7 @@ EXPORT(int, sceKernelDeleteThread, SceUID thid) {
+ 
+ EXPORT(int, sceKernelDeleteTimer, SceUID timer_handle) {
+     TRACY_FUNC(sceKernelDeleteTimer, timer_handle);
+-    if (!emuenv.kernel.objects.remove<Timer>(timer_handle))
++    if (!emuenv.kernel.objects.remove<Timer>(timer_handle, thread_id))
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
+ 
+     return SCE_KERNEL_OK;
+@@ -1349,7 +1420,7 @@ EXPORT(int, sceKernelGetMsgPipeCreatorId) {
+ EXPORT(int, sceKernelGetProcessId) {
+     TRACY_FUNC(sceKernelGetProcessId);
+     STUBBED("pid: 1");
+-    return 1;
++    return PROCESS_ID;
+ }
+ 
+ EXPORT(uint64_t, sceKernelGetSystemTimeWide) {
+@@ -1507,6 +1578,9 @@ EXPORT(SceUID, sceKernelOpenSimpleEvent, const char *pName) {
+     if (!found)
+         return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
+ 
++    // A delete that came first wins, as if the name wasn't found
++    if (found->set_system_event(SCE_KERNEL_EVENT_OPEN, system_event_user_data(thread_id)) != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UID_CANNOT_FIND_BY_NAME);
+     return found->uid;
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+index bf2f9ef3..2d3c4776 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+@@ -72,11 +72,13 @@ DECL_EXPORT(SceInt32, _sceKernelWaitEventFlagCB, SceUID evfId, SceUInt32 bitPatt
+ DECL_EXPORT(SceInt32, _sceKernelWaitSema, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
+ DECL_EXPORT(SceInt32, _sceKernelWaitSemaCB, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
+ DECL_EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFlagInfo> pInfo);
++DECL_EXPORT(SceInt32, _sceKernelGetEventInfo, SceUID eventId, Ptr<SceKernelEventInfo> pInfo);
+ DECL_EXPORT(SceInt32, _sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_pattern);
+ DECL_EXPORT(int, _sceKernelPollEventFlag, SceUID event_id, unsigned int flags, unsigned int wait, unsigned int *outBits);
+ DECL_EXPORT(SceInt32, _sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, SceUInt32 *num_wait_thread);
+ DECL_EXPORT(int, _sceKernelCancelSema, SceUID semaId, SceInt32 setCount, SceUInt32 *pNumWaitThreads);
+ DECL_EXPORT(SceInt32, _sceKernelCancelEvent, SceUID eventId, SceUInt32 *pNumWaitThreads);
++DECL_EXPORT(SceInt32, _sceKernelCancelEventWithSetPattern, SceUID eventId, SceUInt32 setPattern, Ptr<SceKernelCancelEventWithSetPattern_opt> pOpt);
+ DECL_EXPORT(SceInt32, _sceKernelCancelMsgPipe, SceUID msgPipeId, SceUInt32 *pNumSendWaitThreads, SceUInt32 *pNumReceiveWaitThreads);
+ DECL_EXPORT(SceInt32, _sceKernelCancelMutex, SceUID mutexId, SceInt32 newCount, SceUInt32 *pNumWaitThreads);
+ DECL_EXPORT(SceInt32, _sceKernelCancelRWLock, SceUID rwLockId, SceUInt32 *pNumReadWaitThreads, SceUInt32 *pNumWriteWaitThreads, SceInt32 flag);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 2ee1c3c9..3da81a62 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1174,9 +1174,16 @@ EXPORT(SceInt32, sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, Sce
+     return CALL_EXPORT(_sceKernelCancelEventFlag, event_id, pattern, num_wait_thread);
+ }
+ 
+-EXPORT(int, sceKernelCancelEventWithSetPattern) {
+-    TRACY_FUNC(sceKernelCancelEventWithSetPattern);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelCancelEventWithSetPattern, SceUID eventId, SceUInt32 setPattern, SceUInt64 userData, Ptr<SceUInt32> pNumWaitThreads) {
++    TRACY_FUNC(sceKernelCancelEventWithSetPattern, eventId, setPattern, userData, pNumWaitThreads);
++    const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
++
++    Ptr<SceKernelCancelEventWithSetPattern_opt> options = Ptr<SceKernelCancelEventWithSetPattern_opt>(stack_alloc(*thread->cpu, sizeof(SceKernelCancelEventWithSetPattern_opt)));
++    options.get(emuenv.mem)->userData = userData;
++    options.get(emuenv.mem)->pNumWaitThreads = pNumWaitThreads;
++    const SceInt32 res = CALL_EXPORT(_sceKernelCancelEventWithSetPattern, eventId, setPattern, options);
++    stack_free(*thread->cpu, sizeof(SceKernelCancelEventWithSetPattern_opt));
++    return res;
+ }
+ 
+ EXPORT(SceInt32, sceKernelCancelMsgPipe, SceUID msgPipeId, SceUInt32 *pNumSendWaitThreads, SceUInt32 *pNumReceiveWaitThreads) {
+@@ -1368,9 +1375,9 @@ EXPORT(SceInt32, sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFlag
+     return CALL_EXPORT(_sceKernelGetEventFlagInfo, evfId, pInfo);
+ }
+ 
+-EXPORT(int, sceKernelGetEventInfo) {
+-    TRACY_FUNC(sceKernelGetEventInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetEventInfo, SceUID eventId, Ptr<SceKernelEventInfo> pInfo) {
++    TRACY_FUNC(sceKernelGetEventInfo, eventId, pInfo);
++    return CALL_EXPORT(_sceKernelGetEventInfo, eventId, pInfo);
+ }
+ 
+ EXPORT(SceInt32, sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_pattern) {
+-- 
+2.54.0.windows.1
+

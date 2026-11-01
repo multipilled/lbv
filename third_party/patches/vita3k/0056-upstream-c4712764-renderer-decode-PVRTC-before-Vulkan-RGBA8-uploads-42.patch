@@ -1,0 +1,38 @@
+From 184499d93d5b2b644da91d8a3fccbb1f1726e6d3 Mon Sep 17 00:00:00 2001
+From: Paul <devnoname120@gmail.com>
+Date: Sun, 25 Oct 2026 03:01:33 +0100
+Subject: [PATCH 56/58] renderer: decode PVRTC before Vulkan RGBA8 uploads
+ (#4298)
+
+* renderer: decode PVRTC before Vulkan RGBA8 uploads
+
+* renderer: avoid Python 3.9-only texture test helper
+
+* renderer: keep texture extraction checks local
+
+* renderer: mark PVRTC software decoding as provisional
+
+(cherry picked from commit c4712764e3cf78852b5f6e2177866505db61a497)
+---
+ vita3k/renderer/src/vulkan/texture.cpp | 5 ++---
+ 1 file changed, 2 insertions(+), 3 deletions(-)
+
+diff --git a/vita3k/renderer/src/vulkan/texture.cpp b/vita3k/renderer/src/vulkan/texture.cpp
+index 44e9d6d3..7809f6c4 100644
+--- a/vita3k/renderer/src/vulkan/texture.cpp
++++ b/vita3k/renderer/src/vulkan/texture.cpp
+@@ -314,9 +314,8 @@ bool VKTextureCache::init(const bool hashless_texture_cache, const fs::path &tex
+     support_e5rgb9 = static_cast<bool>(e5rgb9_support.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage);
+     support_a2rgb10 = static_cast<bool>(a2rgb10_support.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage);
+ 
+-    // powerVR only
+-    const vk::FormatProperties pvrt_support = state.physical_device.getFormatProperties(vk::Format::ePvrtc12BppUnormBlockIMG);
+-    support_pvrt = static_cast<bool>(pvrt_support.optimalTilingFeatures & vk::FormatFeatureFlagBits::eSampledImage);
++    // TODO: PVRTC is mapped to RGBA8, so keep software decoding until native PVRTC formats are mapped.
++    support_pvrt = false;
+ 
+     // check for dxt support
+     const vk::FormatProperties dxt_support = state.physical_device.getFormatProperties(vk::Format::eBc1RgbaSrgbBlock);
+-- 
+2.54.0.windows.1
+

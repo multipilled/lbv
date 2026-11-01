@@ -1,0 +1,8 @@
+[submodule "third_party/recomp"]
+	path = third_party/recomp
+	url = https://github.com/vita-recomps/vita-recomp-kit.git
+	branch = main
+[submodule "third_party/vita3k"]
+	path = third_party/vita3k
+	url = https://github.com/vita-recomps/Vita3K.git
+	branch = games

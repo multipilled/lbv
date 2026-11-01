@@ -1,0 +1,474 @@
+From 3c9767d8ad8bc7ea02ebe3b746ed712f01016154 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Tue, 20 Oct 2026 23:20:01 +0900
+Subject: [PATCH 37/52] kernel: sync primitive info sizes fix and LW mutex
+ owner UID (#4273)
+
+* kernel: leave the whole struct's size in the info calls' size field
+
+The info calls wrote back the size the game asked for.
+Vita writes the size of the whole struct there, whatever part of it the game asked for.
+
+* kernel: take any rwlock info size up to the struct, like the other info calls
+
+The rwlock info refused every size below the whole struct and took any size above it.
+Vita takes any size up to the struct and refuses a bigger one with NO_MEMORY, like the other info calls.
+
+* kernel: implement the lightweight condition variable info
+
+* kernel: keep a mutex owner and a rwlock writer as their thread's UID
+
+A LW  mutex stays locked by an owner that ended, even once it was deleted, and its info keeps reporting that UID.
+The mutex kept a reference to the owner's thread for it, so a deleted thread's stack, TLS and CPU state stayed allocated until the mutex went away.
+
+(cherry picked from commit 7622d0fbbdfadea9cb0cc44458d570fc201a438a)
+---
+ .../kernel/include/kernel/sync_primitives.h   | 16 +++--
+ vita3k/kernel/include/kernel/types.h          | 11 ++++
+ vita3k/kernel/src/sync_primitives.cpp         | 65 ++++++++++++-------
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 65 ++++++++++++++-----
+ .../modules/SceKernelThreadMgr/SceThreadmgr.h |  2 +
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  | 14 ++--
+ 6 files changed, 125 insertions(+), 48 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index f01ff624..80c44ba4 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -182,7 +182,9 @@ protected:
+     // Guarded by the lock, read by the info of each kind of mutex
+     WaitQueue<WaitEntry> waiters;
+     SceInt32 lock_count;
+-    ThreadStatePtr owner;
++    // The UID of the thread that holds it, or 0. A UID and not the thread, since a lightweight mutex
++    // stays locked by an owner that ended and was deleted.
++    SceUID owner;
+ 
+ private:
+     void on_delete() override;
+@@ -255,8 +257,8 @@ private:
+     // The read locks of every reader, or the writer's count. Readers aren't tracked one by one, like
+     // on a Vita, so any thread may read unlock while readers hold it.
+     SceInt32 lock_count = 0;
+-    // The thread that holds the write lock, if one does
+-    ThreadStatePtr write_owner;
++    // The UID of the thread that holds the write lock, or 0
++    SceUID write_owner = 0;
+     WaitQueue<WaitEntry> waiters;
+ };
+ 
+@@ -339,7 +341,13 @@ private:
+ 
+ class LwCond final : public WithUidClass<Condvar, UidClass::lw_cond> {
+ public:
+-    using WithUidClass::WithUidClass;
++    LwCond(SceUInt32 attr, const char *name, MutexPtr associated_mutex, Ptr<SceKernelLwCondWork> workarea);
++
++    // Fills info with what the lightweight condition variable's info reports, or returns
++    // UNKNOWN_LW_COND_ID if it was deleted.
++    SceInt32 info(SceKernelLwCondInfo &info) const;
++
++    const Ptr<SceKernelLwCondWork> workarea;
+ };
+ 
+ class HeavyCond final : public WithUidClass<Condvar, UidClass::cond> {
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index ad035f08..051d616a 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -783,6 +783,17 @@ struct SceKernelLwCondWork {
+ };
+ static_assert(sizeof(SceKernelLwCondWork) == 16, "Incorrect size");
+ 
++struct SceKernelLwCondInfo {
++    SceSize size; /**< Size of this structure (sizeof(SceKernelLwCondInfo)) */
++    SceUID uid; /**< Lightweight condition variable identifier */
++    char name[KERNELOBJECT_MAX_NAME_LENGTH + 1]; /**< Name given to sceKernelCreateLwCond() */
++    SceUInt32 attr; /**< Attributes given to sceKernelCreateLwCond() */
++    Ptr<SceKernelLwCondWork> pWork; /**< Work area given to sceKernelCreateLwCond() */
++    Ptr<SceKernelLwMutexWork> pLwMutex; /**< Work area of the lightweight mutex it uses */
++    SceUInt32 numWaitThreads; /**< Number of threads waiting on it */
++};
++static_assert(sizeof(SceKernelLwCondInfo) == 0x38, "Incorrect size");
++
+ struct SceKernelCreateLwMutex_opt {
+     int init_count;
+     Ptr<SceKernelLwMutexOptParam> opt_param;
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 0a8f506b..78029915 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -447,7 +447,7 @@ Mutex::Mutex(SceUInt32 attr, const char *name, SceInt32 init_count, ThreadStateP
+     , workarea(workarea)
+     , waiters(attr)
+     , lock_count(init_count)
+-    , owner(init_count > 0 ? std::move(thread) : nullptr) {}
++    , owner(init_count > 0 && thread ? thread->id : 0) {}
+ 
+ SceInt32 Mutex::check_create(const char *name, SceUInt32 attr, SceInt32 init_count, bool kernel) {
+     if (const SceInt32 error = check_name(name, attr))
+@@ -469,7 +469,7 @@ SceInt32 Mutex::check_count(SceInt32 count) const {
+ 
+ void Mutex::on_delete() {
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+-    owner = nullptr;
++    owner = 0;
+ }
+ 
+ SceInt32 Mutex::try_take(MemState &mem, const ThreadStatePtr &thread, SceInt32 count) {
+@@ -478,7 +478,7 @@ SceInt32 Mutex::try_take(MemState &mem, const ThreadStatePtr &thread, SceInt32 c
+     // Already owned
+     if (lock_count > 0) {
+         // Owned by ourselves
+-        if (owner == thread) {
++        if (owner == thread->id) {
+             if (is_recursive) {
+                 if (lightweight()) {
+                     // A lightweight mutex doesn't check for overflow, its count just wraps
+@@ -506,7 +506,7 @@ SceInt32 Mutex::try_take(MemState &mem, const ThreadStatePtr &thread, SceInt32 c
+     // Take ownership!
+ 
+     lock_count += count;
+-    owner = thread;
++    owner = thread->id;
+     update_workarea(mem);
+ 
+     return SCE_KERNEL_OK;
+@@ -516,7 +516,7 @@ void Mutex::update_workarea(MemState &mem) {
+     if (!lightweight())
+         return;
+     workarea.get(mem)->lockCount = lock_count;
+-    workarea.get(mem)->owner = owner ? owner->id : 0;
++    workarea.get(mem)->owner = owner;
+ }
+ 
+ SceInt32 Mutex::acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 count, SceUInt32 *timeout, bool callbacks) {
+@@ -531,13 +531,13 @@ SceInt32 Mutex::acquire(MemState &mem, const ThreadStatePtr &thread, SceInt32 co
+         return error;
+ 
+     // Owned by someone else, wait until it is handed over
+-    if (lock_count > 0 && owner != thread) {
++    if (lock_count > 0 && owner != thread->id) {
+         const Deadline deadline = deadline_from(timeout);
+         const WaitResult r = waiters.wait(guard, thread, target, { count }, deadline, callbacks);
+         writeback_timeout(timeout, deadline);
+ 
+         // A deleted mutex has no owner, and its work area may be freed already
+-        if (owner == thread)
++        if (owner == thread->id)
+             update_workarea(mem);
+ 
+         return guest_result(r);
+@@ -564,7 +564,7 @@ SceInt32 Mutex::release(MemState &mem, const ThreadStatePtr &thread, SceInt32 un
+ 
+     if (const SceInt32 error = check_count(unlock_count))
+         return error;
+-    if (thread != owner)
++    if (thread->id != owner)
+         return lightweight() ? SCE_KERNEL_ERROR_LW_MUTEX_NOT_OWNED : SCE_KERNEL_ERROR_MUTEX_NOT_OWNED;
+     if (unlock_count > lock_count)
+         return lightweight() ? SCE_KERNEL_ERROR_LW_MUTEX_UNLOCK_UDF : SCE_KERNEL_ERROR_MUTEX_UNLOCK_UDF;
+@@ -580,17 +580,17 @@ SceInt32 Mutex::release(MemState &mem, const ThreadStatePtr &thread, SceInt32 un
+ 
+ void Mutex::release_ended_owner(const ThreadState &thread) {
+     const auto guard = lock();
+-    if (!guard || owner.get() != &thread)
++    if (!guard || owner != thread.id)
+         return;
+     lock_count = 0;
+     hand_over();
+ }
+ 
+ void Mutex::hand_over() {
+-    owner = nullptr;
++    owner = 0;
+     if (auto *waiter = waiters.front()) {
+         lock_count += waiter->entry.lock_count;
+-        owner = waiter->thread;
++        owner = waiter->thread->id;
+         waiters.wake(*waiter);
+     }
+ }
+@@ -608,7 +608,7 @@ SceInt32 Mutex::cancel(const ThreadStatePtr &thread, SceInt32 new_count, SceUInt
+ 
+     const auto nb_threads = static_cast<SceUInt32>(waiters.wake_all(SCE_KERNEL_ERROR_WAIT_CANCEL));
+     lock_count = new_count;
+-    owner = new_count > 0 ? thread : nullptr;
++    owner = new_count > 0 ? thread->id : 0;
+     if (num_wait_threads)
+         *num_wait_threads = nb_threads;
+ 
+@@ -627,7 +627,7 @@ SceInt32 LwMutex::info(SceKernelLwMutexInfo &info) const {
+     info.pWork = workarea;
+     info.initCount = init_count;
+     info.currentCount = lock_count;
+-    info.currentOwnerId = owner ? owner->id : 0;
++    info.currentOwnerId = owner;
+     info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
+     return SCE_KERNEL_OK;
+ }
+@@ -643,7 +643,7 @@ SceInt32 HeavyMutex::info(SceKernelMutexInfo &info) const {
+     info.attr = attr;
+     info.initCount = init_count;
+     info.currentCount = lock_count;
+-    info.currentOwnerId = owner ? owner->id : 0;
++    info.currentOwnerId = owner;
+     info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
+     return SCE_KERNEL_OK;
+ }
+@@ -670,7 +670,7 @@ void RWLock::on_delete() {
+ 
+ SceInt32 RWLock::try_take(const ThreadStatePtr &thread, bool is_write) {
+     // The writer may take the write lock again only if the lock is recursive
+-    if (is_write && write_owner == thread) {
++    if (is_write && write_owner == thread->id) {
+         if (!(attr & SCE_KERNEL_RW_LOCK_ATTR_RECURSIVE))
+             return SCE_KERNEL_ERROR_RW_LOCK_RECURSIVE;
+         lock_count++;
+@@ -688,7 +688,7 @@ SceInt32 RWLock::try_take(const ThreadStatePtr &thread, bool is_write) {
+ 
+     lock_count++;
+     if (is_write)
+-        write_owner = thread;
++        write_owner = thread->id;
+     return SCE_KERNEL_OK;
+ }
+ 
+@@ -701,7 +701,7 @@ SceInt32 RWLock::acquire(const ThreadStatePtr &thread, bool is_write, SceUInt32
+         return result;
+     // The writer's own read lock fails at once, it could only wait for itself. A reader's write lock
+     // waits, since readers aren't known one by one.
+-    if (!is_write && write_owner == thread)
++    if (!is_write && write_owner == thread->id)
+         return SCE_KERNEL_ERROR_RW_LOCK_FAILED_TO_LOCK;
+ 
+     // we need to wait
+@@ -750,7 +750,7 @@ SceInt32 RWLock::release(const ThreadStatePtr &thread, bool is_write) {
+ 
+     if (is_write) {
+         // Only the writer may write unlock
+-        if (write_owner != thread)
++        if (write_owner != thread->id)
+             return SCE_KERNEL_ERROR_RW_LOCK_NOT_OWNED;
+     } else {
+         if (write_owner)
+@@ -768,7 +768,7 @@ void RWLock::release_ended_writer(const ThreadState &thread) {
+     const auto guard = lock();
+     if (!guard)
+         return;
+-    if (write_owner.get() != &thread)
++    if (write_owner != thread.id)
+         return;
+     lock_count = 0;
+     hand_over();
+@@ -784,19 +784,19 @@ SceInt32 RWLock::info(SceKernelRWLockInfo &info) const {
+     strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
+     info.attr = attr;
+     info.lockCount = lock_count;
+-    info.writeOwnerId = write_owner ? write_owner->id : 0;
++    info.writeOwnerId = write_owner;
+     info.numReadWaitThreads = static_cast<SceUInt32>(waiters.count_if([](const auto &waiter) { return !waiter.entry.is_write; }));
+     info.numWriteWaitThreads = static_cast<SceUInt32>(waiters.count_if([](const auto &waiter) { return waiter.entry.is_write; }));
+     return SCE_KERNEL_OK;
+ }
+ 
+ void RWLock::hand_over() {
+-    write_owner = nullptr;
++    write_owner = 0;
+ 
+     // The first waiting writer goes first, even before readers that waited longer. Without one,
+     // every waiting reader gets the lock at once.
+     if (auto *writer = waiters.find_if([](auto &waiter) { return waiter.entry.is_write; })) {
+-        write_owner = writer->thread;
++        write_owner = writer->thread->id;
+         lock_count = 1;
+         waiters.wake(*writer);
+     } else {
+@@ -816,7 +816,7 @@ SceInt32 RWLock::cancel(const ThreadStatePtr &thread, SceUInt32 *num_read_wait_t
+     // The lock is reset, and only the calling thread may hold it afterwards
+     const bool write_locked = flag & SCE_KERNEL_RW_LOCK_CANCEL_WITH_WRITE_LOCK;
+     lock_count = write_locked ? 1 : 0;
+-    write_owner = write_locked ? thread : nullptr;
++    write_owner = write_locked ? thread->id : 0;
+ 
+     if (num_read_wait_threads)
+         *num_read_wait_threads = nb_readers;
+@@ -1029,6 +1029,25 @@ SceInt32 HeavyCond::info(SceKernelCondInfo &info) const {
+     return SCE_KERNEL_OK;
+ }
+ 
++LwCond::LwCond(SceUInt32 attr, const char *name, MutexPtr associated_mutex, Ptr<SceKernelLwCondWork> workarea)
++    : WithUidClass(attr, name, std::move(associated_mutex))
++    , workarea(workarea) {}
++
++SceInt32 LwCond::info(SceKernelLwCondInfo &info) const {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID;
++
++    info = {};
++    info.uid = uid;
++    strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
++    info.attr = attr;
++    info.pWork = workarea;
++    info.pLwMutex = associated_mutex->workarea;
++    info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
++    return SCE_KERNEL_OK;
++}
++
+ // **************
+ // * Event Flag *
+ // **************
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 0cb04840..6b5a9155 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -37,14 +37,21 @@ inline static uint64_t get_current_time() {
+         .count();
+ }
+ 
+-// Copies the start of full to info, as many bytes as the size the game set in info asks for. A size
+-// past the struct must be refused before.
++// Copies the start of full to info, as many bytes as the size the game set in info asks for, with
++// the size of the whole struct in its size field. A size past the struct must be refused before.
+ template <typename T>
+ static void write_info(T *info, T full) {
+-    full.size = info->size;
++    full.size = sizeof(T);
+     memcpy(info, &full, info->size);
+ }
+ 
++// Same as write_info, for a call that takes the size apart from the struct
++template <typename T>
++static void write_info(T *info, T full, SceSize size) {
++    full.size = sizeof(T);
++    memcpy(info, &full, size);
++}
++
+ // Waits on a simple event or a timer, which are both events.
+ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
+     const ThreadStatePtr thread = emuenv.kernel.get_thread(thread_id);
+@@ -176,7 +183,7 @@ EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const cha
+     if (!mutex)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_MUTEX_ID);
+ 
+-    const auto condvar = std::make_shared<LwCond>(attr, name, mutex);
++    const auto condvar = std::make_shared<LwCond>(attr, name, mutex, workarea);
+     SceKernelLwCondWork *work = workarea.get(emuenv.mem);
+     *work = {};
+     work->uid = emuenv.kernel.objects.add(condvar, emuenv.kernel.get_next_uid());
+@@ -354,14 +361,44 @@ EXPORT(SceInt32, _sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_patt
+     return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, _sceKernelGetLwCondInfo) {
+-    TRACY_FUNC(_sceKernelGetLwCondInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo) {
++    TRACY_FUNC(_sceKernelGetLwCondInfo, workarea, pInfo);
++    const SceKernelLwCondWork *work = workarea.get(emuenv.mem);
++    if (!work)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    const std::shared_ptr<LwCond> condvar = emuenv.kernel.objects.find<LwCond>(work->uid);
++    SceKernelLwCondInfo full;
++    if (!condvar || condvar->info(full) != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
++
++    SceKernelLwCondInfo *info = pInfo.get(emuenv.mem);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    if (info->size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_SIZE);
++
++    write_info(info, full);
++    // The UID from the work area, whatever size the game asked for
++    info->uid = work->uid;
++    return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, _sceKernelGetLwCondInfoById) {
+-    TRACY_FUNC(_sceKernelGetLwCondInfoById);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo, const SceSize *size) {
++    TRACY_FUNC(_sceKernelGetLwCondInfoById, lwCondId, pInfo, size);
++    if (!size)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    SceKernelLwCondInfo *info = pInfo.get(emuenv.mem);
++    if (info && *size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++    const std::shared_ptr<LwCond> condvar = emuenv.kernel.objects.find<LwCond>(lwCondId);
++    SceKernelLwCondInfo full;
++    if (!condvar || condvar->info(full) != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_LW_COND_ID);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++
++    write_info(info, full, *size);
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, _sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info, SceSize size) {
+@@ -416,16 +453,14 @@ EXPORT(int, _sceKernelGetRWLockInfo, SceUID rwlockId, SceKernelRWLockInfo *info)
+     TRACY_FUNC(_sceKernelGetRWLockInfo, rwlockId, info);
+     if (!info)
+         return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+-    if (info->size < sizeof(SceKernelRWLockInfo))
+-        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_ARGUMENT);
++    if (info->size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
+     const RWLockPtr rwlock = emuenv.kernel.objects.find<RWLock>(rwlockId);
+     SceKernelRWLockInfo full;
+     if (!rwlock || rwlock->info(full) != SCE_KERNEL_OK)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_RW_LOCK_ID);
+ 
+-    // Everything but the size the caller gave
+-    full.size = info->size;
+-    *info = full;
++    write_info(info, full);
+     return SCE_KERNEL_OK;
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+index f34357c2..bf2f9ef3 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+@@ -51,6 +51,8 @@ DECL_EXPORT(SceInt32, _sceKernelLockReadRWLockCB, SceUID lock_id, SceUInt32 *tim
+ DECL_EXPORT(SceInt32, _sceKernelLockWriteRWLock, SceUID lock_id, SceUInt32 *timeout);
+ DECL_EXPORT(SceInt32, _sceKernelLockWriteRWLockCB, SceUID lock_id, SceUInt32 *timeout);
+ DECL_EXPORT(int, _sceKernelCreateLwCond, Ptr<SceKernelLwCondWork> workarea, const char *name, SceUInt attr, Ptr<SceKernelCreateLwCond_opt> opt);
++DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo);
++DECL_EXPORT(SceInt32, _sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo, const SceSize *size);
+ DECL_EXPORT(SceInt32, _sceKernelGetCallbackInfo, SceUID callbackId, SceKernelCallbackInfo *pInfo);
+ DECL_EXPORT(int, _sceKernelGetRWLockInfo, SceUID rwlockId, SceKernelRWLockInfo *info);
+ DECL_EXPORT(SceInt32, _sceKernelGetThreadCpuAffinityMask, SceUID thid);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 0a8fc633..c10a3db1 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1378,14 +1378,16 @@ EXPORT(SceInt32, sceKernelGetEventPattern, SceUID event_id, SceUInt32 *get_patte
+     return CALL_EXPORT(_sceKernelGetEventPattern, event_id, get_pattern);
+ }
+ 
+-EXPORT(int, sceKernelGetLwCondInfo) {
+-    TRACY_FUNC(sceKernelGetLwCondInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetLwCondInfo, Ptr<SceKernelLwCondWork> workarea, Ptr<SceKernelLwCondInfo> pInfo) {
++    TRACY_FUNC(sceKernelGetLwCondInfo, workarea, pInfo);
++    return CALL_EXPORT(_sceKernelGetLwCondInfo, workarea, pInfo);
+ }
+ 
+-EXPORT(int, sceKernelGetLwCondInfoById) {
+-    TRACY_FUNC(sceKernelGetLwCondInfoById);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetLwCondInfoById, SceUID lwCondId, Ptr<SceKernelLwCondInfo> pInfo) {
++    TRACY_FUNC(sceKernelGetLwCondInfoById, lwCondId, pInfo);
++    // The kernel gets the size apart, 0 without a struct
++    const SceSize size = pInfo ? pInfo.get(emuenv.mem)->size : 0;
++    return CALL_EXPORT(_sceKernelGetLwCondInfoById, lwCondId, pInfo, &size);
+ }
+ 
+ EXPORT(int, sceKernelGetLwMutexInfoById, SceUID lightweight_mutex_id, Ptr<SceKernelLwMutexInfo> info) {
+-- 
+2.54.0.windows.1
+

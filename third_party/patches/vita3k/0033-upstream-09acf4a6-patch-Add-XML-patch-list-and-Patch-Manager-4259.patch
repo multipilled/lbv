@@ -1,0 +1,1040 @@
+From 1525d51fba9323afa94ac5b04a3a88845b78c487 Mon Sep 17 00:00:00 2001
+From: nishinji <107111782+nishinji@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 20:40:12 +0900
+Subject: [PATCH 33/52] patch: Add XML patch list and Patch Manager (#4259)
+
+* patch: Add XML patch list and Patch Manager
+
+Load patchlist.xml entries keyed by title ID, version and NID.
+Add a Qt Patch Manager (Manage menu) with patch list download.
+Log the main executable NID on launch for the NID attribute.
+
+(cherry picked from commit 09acf4a68b0bd02910600b67f206a4994e8b856e)
+---
+ vita3k/gui-qt/CMakeLists.txt                  |   3 +
+ .../include/gui-qt/patch_manager_dialog.h     |  68 ++++
+ vita3k/gui-qt/src/main_window.cpp             |   7 +
+ vita3k/gui-qt/src/main_window.ui              |   6 +
+ vita3k/gui-qt/src/patch_manager_dialog.cpp    | 319 ++++++++++++++++++
+ vita3k/interface.cpp                          |  15 +-
+ vita3k/patch/CMakeLists.txt                   |   3 +-
+ vita3k/patch/include/patch/patch.h            |  35 ++
+ vita3k/patch/include/patch/util.h             |   5 +
+ vita3k/patch/src/patch_xml.cpp                | 158 +++++++++
+ vita3k/patch/src/util.cpp                     | 198 +++++++++++
+ vita3k/util/include/util/fs.h                 |   2 +-
+ vita3k/util/src/fs_utils.cpp                  |  11 +-
+ 13 files changed, 822 insertions(+), 8 deletions(-)
+ create mode 100644 vita3k/gui-qt/include/gui-qt/patch_manager_dialog.h
+ create mode 100644 vita3k/gui-qt/src/patch_manager_dialog.cpp
+ create mode 100644 vita3k/patch/src/patch_xml.cpp
+
+diff --git a/vita3k/gui-qt/CMakeLists.txt b/vita3k/gui-qt/CMakeLists.txt
+index c3bed6d1..c8b44e48 100644
+--- a/vita3k/gui-qt/CMakeLists.txt
++++ b/vita3k/gui-qt/CMakeLists.txt
+@@ -19,6 +19,7 @@ add_library(gui-qt STATIC
+     src/live_area_widget.cpp
+     src/log_widget.cpp
+     src/persistent_settings.cpp
++    src/patch_manager_dialog.cpp
+     src/pkg_install_dialog.cpp
+     src/physical_key_qt.cpp
+     src/qt_utils.cpp
+@@ -64,6 +65,7 @@ add_library(gui-qt STATIC
+     include/gui-qt/live_area_widget.h
+     include/gui-qt/log_widget.h
+     include/gui-qt/persistent_settings.h
++    include/gui-qt/patch_manager_dialog.h
+     include/gui-qt/pkg_install_dialog.h
+     include/gui-qt/physical_key_qt.h
+     include/gui-qt/qt_utils.h
+@@ -108,6 +110,7 @@ target_link_libraries(gui-qt PUBLIC
+     kernel
+     motion
+     packages
++    patch
+     renderer
+     touch
+     gxm
+diff --git a/vita3k/gui-qt/include/gui-qt/patch_manager_dialog.h b/vita3k/gui-qt/include/gui-qt/patch_manager_dialog.h
+new file mode 100644
+index 00000000..ffca6a1a
+--- /dev/null
++++ b/vita3k/gui-qt/include/gui-qt/patch_manager_dialog.h
+@@ -0,0 +1,68 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#pragma once
++
++#include <patch/patch.h>
++
++#include <QDialog>
++#include <QPointer>
++
++#include <map>
++
++struct EmuEnvState;
++
++class QCheckBox;
++class QLineEdit;
++class QPlainTextEdit;
++class QPushButton;
++class QThread;
++class QTreeWidget;
++
++class PatchManagerDialog : public QDialog {
++    Q_OBJECT
++public:
++    explicit PatchManagerDialog(EmuEnvState &emuenv, QWidget *parent = nullptr);
++
++private:
++    void reload_entries();
++    void populate_tree();
++    void apply_filter();
++    void update_info();
++    bool save();
++    void download_patches();
++    void on_download_finished(bool success, const QString &message);
++
++    EmuEnvState &m_emuenv;
++    PatchEntries m_entries;
++    EnabledPatches m_enabled;
++    std::map<std::string, std::string> m_owned_versions;
++
++    QLineEdit *m_filter = nullptr;
++    QCheckBox *m_owned_only = nullptr;
++    QTreeWidget *m_tree = nullptr;
++    QLineEdit *m_title = nullptr;
++    QLineEdit *m_serial = nullptr;
++    QLineEdit *m_game_version = nullptr;
++    QLineEdit *m_nid = nullptr;
++    QLineEdit *m_patch_name = nullptr;
++    QLineEdit *m_patch_version = nullptr;
++    QLineEdit *m_author = nullptr;
++    QPlainTextEdit *m_notes = nullptr;
++    QPushButton *m_download = nullptr;
++    QPointer<QThread> m_download_thread;
++};
+diff --git a/vita3k/gui-qt/src/main_window.cpp b/vita3k/gui-qt/src/main_window.cpp
+index 0e6ec99d..6dbf70e0 100644
+--- a/vita3k/gui-qt/src/main_window.cpp
++++ b/vita3k/gui-qt/src/main_window.cpp
+@@ -34,6 +34,7 @@
+ #include <gui-qt/live_area_widget.h>
+ #include <gui-qt/log_widget.h>
+ #include <gui-qt/main_window.h>
++#include <gui-qt/patch_manager_dialog.h>
+ #include <gui-qt/persistent_settings.h>
+ #include <gui-qt/pkg_install_dialog.h>
+ #include <gui-qt/qt_utils.h>
+@@ -435,6 +436,12 @@ void MainWindow::initialize() {
+     connect(m_ui->vita_themes_action, &QAction::triggered,
+         this, &MainWindow::open_vita_themes);
+ 
++    connect(m_ui->patch_manager_action, &QAction::triggered, this, [this] {
++        auto *dlg = new PatchManagerDialog(emuenv, this);
++        connect(dlg, &QDialog::finished, dlg, &QObject::deleteLater);
++        dlg->exec();
++    });
++
+     connect(m_ui->user_management_action, &QAction::triggered,
+         this, &MainWindow::open_user_management);
+ 
+diff --git a/vita3k/gui-qt/src/main_window.ui b/vita3k/gui-qt/src/main_window.ui
+index 811ab376..3d62203f 100644
+--- a/vita3k/gui-qt/src/main_window.ui
++++ b/vita3k/gui-qt/src/main_window.ui
+@@ -74,6 +74,7 @@
+     </property>
+     <addaction name="vita_themes_action"/>
+     <addaction name="trophy_collection_action"/>
++    <addaction name="patch_manager_action"/>
+     <addaction name="user_management_action"/>
+    </widget>
+    <widget class="QMenu" name="menuView">
+@@ -247,6 +248,11 @@
+     <string>Vita Themes</string>
+    </property>
+   </action>
++  <action name="patch_manager_action">
++   <property name="text">
++    <string>Patch Manager</string>
++   </property>
++  </action>
+   <action name="user_management_action">
+    <property name="text">
+     <string>User Management</string>
+diff --git a/vita3k/gui-qt/src/patch_manager_dialog.cpp b/vita3k/gui-qt/src/patch_manager_dialog.cpp
+new file mode 100644
+index 00000000..3d1fcc49
+--- /dev/null
++++ b/vita3k/gui-qt/src/patch_manager_dialog.cpp
+@@ -0,0 +1,319 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include <gui-qt/patch_manager_dialog.h>
++
++#include <app/functions.h>
++#include <emuenv/state.h>
++#include <util/fs.h>
++#include <util/net_utils.h>
++
++#include <QCheckBox>
++#include <QCoreApplication>
++#include <QDialogButtonBox>
++#include <QFormLayout>
++#include <QGroupBox>
++#include <QHBoxLayout>
++#include <QHeaderView>
++#include <QLabel>
++#include <QLineEdit>
++#include <QMessageBox>
++#include <QPlainTextEdit>
++#include <QPushButton>
++#include <QThread>
++#include <QTreeWidget>
++#include <QVBoxLayout>
++
++#include <algorithm>
++
++namespace {
++
++constexpr int ENTRY_INDEX_ROLE = Qt::UserRole;
++
++QLineEdit *make_read_only_field() {
++    auto *field = new QLineEdit;
++    field->setReadOnly(true);
++    return field;
++}
++
++QString entry_label(const PatchEntry &entry) {
++    QStringList details;
++    if (!entry.app_ver.empty())
++        details << QString::fromStdString(entry.app_ver);
++    if (entry.app_elf != "eboot.bin")
++        details << QString::fromStdString(entry.app_elf);
++    const QString name = QString::fromStdString(entry.name);
++    return details.isEmpty() ? name : QStringLiteral("%1 (%2)").arg(name, details.join(QStringLiteral(", ")));
++}
++
++} // namespace
++
++PatchManagerDialog::PatchManagerDialog(EmuEnvState &emuenv, QWidget *parent)
++    : QDialog(parent)
++    , m_emuenv(emuenv) {
++    setWindowTitle(tr("Patch Manager"));
++    resize(1000, 600);
++
++    for (const auto &app : app::get_apps(emuenv))
++        m_owned_versions[app.title_id] = app.app_ver;
++
++    m_filter = new QLineEdit;
++    m_filter->setPlaceholderText(tr("Filter patches"));
++    m_filter->setClearButtonEnabled(true);
++    m_owned_only = new QCheckBox(tr("Only show owned games"));
++    m_owned_only->setChecked(true);
++
++    m_tree = new QTreeWidget;
++    m_tree->setHeaderHidden(true);
++    m_tree->setUniformRowHeights(true);
++
++    auto *filter_row = new QHBoxLayout;
++    filter_row->addWidget(m_filter, 1);
++    filter_row->addWidget(m_owned_only);
++
++    auto *left = new QVBoxLayout;
++    left->addLayout(filter_row);
++    left->addWidget(m_tree, 1);
++
++    m_title = make_read_only_field();
++    m_serial = make_read_only_field();
++    m_game_version = make_read_only_field();
++    m_nid = make_read_only_field();
++    m_patch_name = make_read_only_field();
++    m_patch_version = make_read_only_field();
++    m_author = make_read_only_field();
++    m_notes = new QPlainTextEdit;
++    m_notes->setReadOnly(true);
++
++    auto *form = new QFormLayout;
++    form->addRow(tr("Game Title"), m_title);
++    form->addRow(tr("Serial"), m_serial);
++    form->addRow(tr("Game Version"), m_game_version);
++    form->addRow(tr("NID"), m_nid);
++    form->addRow(tr("Patch"), m_patch_name);
++    form->addRow(tr("Patch Version"), m_patch_version);
++    form->addRow(tr("Author"), m_author);
++    form->addRow(tr("Notes"), m_notes);
++    form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
++
++    auto *info_box = new QGroupBox(tr("Patch Information"));
++    info_box->setLayout(form);
++    info_box->setMinimumWidth(340);
++
++    auto *content = new QHBoxLayout;
++    content->addLayout(left, 3);
++    content->addWidget(info_box, 2);
++
++    m_download = new QPushButton(tr("Download latest patches"));
++    auto *buttons = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel | QDialogButtonBox::Apply);
++
++    auto *bottom = new QHBoxLayout;
++    bottom->addWidget(m_download);
++    bottom->addStretch(1);
++    bottom->addWidget(buttons);
++
++    auto *layout = new QVBoxLayout(this);
++    layout->addLayout(content, 1);
++    layout->addWidget(new QLabel(tr("Changes take effect the next time a game is started.")));
++    layout->addLayout(bottom);
++
++    connect(m_filter, &QLineEdit::textChanged, this, &PatchManagerDialog::apply_filter);
++    connect(m_owned_only, &QCheckBox::toggled, this, &PatchManagerDialog::apply_filter);
++    connect(m_tree, &QTreeWidget::currentItemChanged, this, &PatchManagerDialog::update_info);
++    connect(m_tree, &QTreeWidget::itemChanged, this, [this](QTreeWidgetItem *item) {
++        const QVariant index = item->data(0, ENTRY_INDEX_ROLE);
++        if (!index.isValid())
++            return;
++
++        const std::string key = m_entries[index.toInt()].key();
++        if (item->checkState(0) == Qt::Checked)
++            m_enabled.insert(key);
++        else
++            m_enabled.erase(key);
++    });
++    connect(m_download, &QPushButton::clicked, this, &PatchManagerDialog::download_patches);
++    connect(buttons, &QDialogButtonBox::accepted, this, [this] {
++        if (save())
++            accept();
++    });
++    connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
++    connect(buttons->button(QDialogButtonBox::Apply), &QPushButton::clicked, this, &PatchManagerDialog::save);
++
++    reload_entries();
++}
++
++void PatchManagerDialog::reload_entries() {
++    m_entries = load_patch_entries(m_emuenv.patch_path);
++    m_enabled = load_enabled_patches(m_emuenv.patch_path);
++    populate_tree();
++}
++
++void PatchManagerDialog::populate_tree() {
++    const QSignalBlocker blocker(m_tree);
++    m_tree->clear();
++
++    std::vector<int> order(m_entries.size());
++    for (size_t i = 0; i < order.size(); ++i)
++        order[i] = static_cast<int>(i);
++    std::stable_sort(order.begin(), order.end(), [this](int a, int b) {
++        return QString::compare(QString::fromStdString(m_entries[a].title), QString::fromStdString(m_entries[b].title), Qt::CaseInsensitive) < 0;
++    });
++
++    QTreeWidgetItem *group = nullptr;
++    for (const int index : order) {
++        const auto &entry = m_entries[index];
++        if (entry.nid.empty())
++            continue;
++
++        const QString title = QString::fromStdString(entry.title);
++        if (!group || group->text(0) != title) {
++            group = new QTreeWidgetItem(m_tree, QStringList{ title });
++        }
++
++        auto *item = new QTreeWidgetItem(group, QStringList{ entry_label(entry) });
++        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
++        item->setData(0, ENTRY_INDEX_ROLE, index);
++        item->setCheckState(0, m_enabled.contains(entry.key()) ? Qt::Checked : Qt::Unchecked);
++    }
++
++    apply_filter();
++    update_info();
++}
++
++void PatchManagerDialog::apply_filter() {
++    const QString filter = m_filter->text().trimmed();
++    const bool owned_only = m_owned_only->isChecked();
++
++    for (int i = 0; i < m_tree->topLevelItemCount(); ++i) {
++        auto *group = m_tree->topLevelItem(i);
++        int visible_children = 0;
++
++        for (int j = 0; j < group->childCount(); ++j) {
++            auto *item = group->child(j);
++            const auto &entry = m_entries[item->data(0, ENTRY_INDEX_ROLE).toInt()];
++
++            bool visible = true;
++            if (owned_only)
++                visible = std::any_of(entry.title_ids.begin(), entry.title_ids.end(), [this, &entry](const std::string &id) {
++                    const auto owned = m_owned_versions.find(id);
++                    return owned != m_owned_versions.end() && (entry.app_ver.empty() || patch_versions_equal(entry.app_ver, owned->second));
++                });
++            if (visible && !filter.isEmpty()) {
++                QString haystack = QString::fromStdString(entry.title + ' ' + entry.name);
++                for (const auto &id : entry.title_ids)
++                    haystack += QLatin1Char(' ') + QString::fromStdString(id);
++                visible = haystack.contains(filter, Qt::CaseInsensitive);
++            }
++
++            item->setHidden(!visible);
++            visible_children += visible;
++        }
++        group->setHidden(visible_children == 0);
++    }
++}
++
++void PatchManagerDialog::update_info() {
++    const auto *item = m_tree->currentItem();
++    const QVariant index = item ? item->data(0, ENTRY_INDEX_ROLE) : QVariant();
++
++    if (!index.isValid()) {
++        for (auto *field : { m_title, m_serial, m_game_version, m_nid, m_patch_name, m_patch_version, m_author })
++            field->clear();
++        m_notes->clear();
++        return;
++    }
++
++    const auto &entry = m_entries[index.toInt()];
++    QStringList serials;
++    for (const auto &id : entry.title_ids)
++        serials << QString::fromStdString(id);
++
++    m_title->setText(QString::fromStdString(entry.title));
++    m_serial->setText(serials.join(QStringLiteral(", ")));
++    m_game_version->setText(QString::fromStdString(entry.app_ver));
++    m_nid->setText(QString::fromStdString(entry.nid));
++    m_patch_name->setText(QString::fromStdString(entry.name));
++    m_patch_version->setText(QString::fromStdString(entry.patch_ver));
++    m_author->setText(QString::fromStdString(entry.author));
++    m_notes->setPlainText(QString::fromStdString(entry.note));
++}
++
++bool PatchManagerDialog::save() {
++    if (save_enabled_patches(m_emuenv.patch_path, m_enabled))
++        return true;
++
++    QMessageBox::critical(this, tr("Patch Manager"), tr("Failed to save the patch configuration."));
++    return false;
++}
++
++void PatchManagerDialog::download_patches() {
++    if (m_download_thread)
++        return;
++
++    m_download->setEnabled(false);
++    m_download->setText(tr("Downloading..."));
++
++    const fs::path patch_dir = m_emuenv.patch_path;
++    m_download_thread = QThread::create([self = QPointer<PatchManagerDialog>(this), patch_dir] {
++        const std::string xml = net_utils::get_web_response(PATCHLIST_XML_URL);
++        PatchEntries entries;
++        bool success = false;
++        QString message;
++        if (xml.empty()) {
++            message = QCoreApplication::translate("PatchManagerDialog", "Could not download the patch list. Please try again later.");
++        } else if (!parse_patch_entries(xml, entries)) {
++            message = QCoreApplication::translate("PatchManagerDialog", "The downloaded patch list is not valid.");
++        } else {
++            const fs::path path = patchlist_xml_path(patch_dir);
++            const fs::path temp_path = fs::path(path).concat(".tmp");
++            boost::system::error_code error;
++            bool saved = false;
++            fs::create_directories(patch_dir, error);
++            if (!error && fs_utils::dump_data(temp_path, xml.data(), static_cast<std::streamsize>(xml.size()))) {
++                fs::rename(temp_path, path, error);
++                saved = !error;
++            }
++            if (!saved) {
++                fs::remove(temp_path, error);
++                message = QCoreApplication::translate("PatchManagerDialog", "Failed to save the patch list.");
++            } else {
++                success = true;
++                message = QCoreApplication::translate("PatchManagerDialog", "Downloaded %n patch(es).", nullptr, static_cast<int>(entries.size()));
++            }
++        }
++        const auto finish = [self, success, message] {
++            if (self)
++                self->on_download_finished(success, message);
++        };
++        QMetaObject::invokeMethod(qApp, finish, Qt::QueuedConnection);
++    });
++    connect(m_download_thread, &QThread::finished, m_download_thread, &QObject::deleteLater);
++    m_download_thread->start();
++}
++
++void PatchManagerDialog::on_download_finished(bool success, const QString &message) {
++    m_download->setEnabled(true);
++    m_download->setText(tr("Download latest patches"));
++
++    if (success) {
++        m_entries = load_patch_entries(m_emuenv.patch_path);
++        populate_tree();
++        QMessageBox::information(this, tr("Patch Manager"), message);
++    } else {
++        QMessageBox::warning(this, tr("Patch Manager"), message);
++    }
++}
+diff --git a/vita3k/interface.cpp b/vita3k/interface.cpp
+index 8f19cae9..1c291f47 100644
+--- a/vita3k/interface.cpp
++++ b/vita3k/interface.cpp
+@@ -547,7 +547,20 @@ static ExitCode load_app_impl(SceUID &main_module_id, EmuEnvState &emuenv, const
+     if (main_module_id >= 0) {
+         const auto module = emuenv.kernel.loaded_modules[main_module_id];
+         LOG_INFO("Main executable {} ({}) loaded", module->info.module_name, emuenv.self_path);
+-        const Patches patches = get_patches(emuenv.patch_path, emuenv.io.title_id, "app0:" + emuenv.self_path);
++        uint32_t module_nid = 0;
++        {
++            const std::lock_guard<std::mutex> guard(emuenv.kernel.export_nids_mutex);
++            for (const auto &[nid, uid] : emuenv.kernel.module_uid_by_nid) {
++                if (uid == static_cast<uint32_t>(main_module_id))
++                    module_nid = nid;
++            }
++        }
++        LOG_INFO("Main executable NID: {} (for the NID attribute of a patch)", fmt::format("0x{:08X}", module_nid));
++
++        const std::string bin = "app0:" + emuenv.self_path;
++        Patches patches = get_patches(emuenv.patch_path, emuenv.io.title_id, bin);
++        const Patches xml_patches = get_xml_patches(emuenv.patch_path, emuenv.io.title_id, bin, emuenv.app_info.app_version, module_nid);
++        patches.insert(patches.end(), xml_patches.begin(), xml_patches.end());
+         if (!patches.empty())
+             do_patches(emuenv.mem, patches, module->info);
+     } else
+diff --git a/vita3k/patch/CMakeLists.txt b/vita3k/patch/CMakeLists.txt
+index 86df6cf9..86e077b2 100644
+--- a/vita3k/patch/CMakeLists.txt
++++ b/vita3k/patch/CMakeLists.txt
+@@ -5,9 +5,10 @@ add_library(
+   include/patch/instructions.h
+   include/patch/util.h
+   src/patch.cpp
++  src/patch_xml.cpp
+   src/instructions.cpp
+   src/util.cpp
+ )
+ 
+ target_include_directories(patch PUBLIC include)
+-target_link_libraries(patch PRIVATE util)
++target_link_libraries(patch PRIVATE util pugixml::pugixml)
+diff --git a/vita3k/patch/include/patch/patch.h b/vita3k/patch/include/patch/patch.h
+index 82f8f5f3..53a9e120 100644
+--- a/vita3k/patch/include/patch/patch.h
++++ b/vita3k/patch/include/patch/patch.h
+@@ -17,6 +17,8 @@
+ 
+ #pragma once
+ 
++#include <cstdint>
++#include <set>
+ #include <string>
+ #include <util/fs.h>
+ #include <vector>
+@@ -34,5 +36,38 @@ struct PatchHeader {
+ 
+ using Patches = std::vector<Patch>;
+ 
++struct PatchEntry {
++    std::vector<std::string> title_ids;
++    std::string title;
++    std::string name;
++    std::string author;
++    std::string note;
++    std::string patch_ver;
++    std::string app_ver;
++    std::string app_elf;
++    std::string nid;
++    Patches patches;
++
++    std::string key() const;
++};
++
++using PatchEntries = std::vector<PatchEntry>;
++using EnabledPatches = std::set<std::string>;
++
+ Patches get_patches(fs::path &path, const std::string &titleid, const std::string &bin);
+ Patch parse_patch(const std::string &patch);
++
++inline constexpr const char *PATCHLIST_XML_URL = "https://github.com/Vita3K/vita3k-patches/releases/download/latest/patchlist.xml";
++
++fs::path patchlist_xml_path(const fs::path &patch_dir);
++fs::path patch_config_path(const fs::path &patch_dir);
++
++bool parse_patch_entries(const std::string &xml, PatchEntries &entries);
++PatchEntries load_patch_entries(const fs::path &patch_dir);
++
++EnabledPatches load_enabled_patches(const fs::path &patch_dir);
++bool save_enabled_patches(const fs::path &patch_dir, const EnabledPatches &enabled);
++
++bool patch_versions_equal(const std::string &a, const std::string &b);
++bool patch_entry_matches(const PatchEntry &entry, const std::string &titleid, const std::string &bin, const std::string &app_ver, uint32_t nid);
++Patches get_xml_patches(const fs::path &patch_dir, const std::string &titleid, const std::string &bin, const std::string &app_ver, uint32_t nid);
+diff --git a/vita3k/patch/include/patch/util.h b/vita3k/patch/include/patch/util.h
+index 636f5ed6..47e143c3 100644
+--- a/vita3k/patch/include/patch/util.h
++++ b/vita3k/patch/include/patch/util.h
+@@ -18,6 +18,7 @@
+ #pragma once
+ 
+ #include <array>
++#include <optional>
+ #include <string>
+ #include <util/types.h>
+ #include <vector>
+@@ -39,3 +40,7 @@ std::vector<std::string> get_args(std::string inst, char open, char close);
+ std::vector<std::string> get_args(std::string inst);
+ 
+ uint32_t translate(std::string &inst, std::vector<uint32_t> &args);
++
++std::optional<uint64_t> parse_hex(std::string_view text);
++std::optional<std::vector<uint8_t>> parse_value(const std::string &text);
++bool parse_address(const std::string &address, uint8_t &seg, uint32_t &offset);
+diff --git a/vita3k/patch/src/patch_xml.cpp b/vita3k/patch/src/patch_xml.cpp
+new file mode 100644
+index 00000000..f45b4ba1
+--- /dev/null
++++ b/vita3k/patch/src/patch_xml.cpp
+@@ -0,0 +1,158 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include "patch/patch.h"
++#include "patch/util.h"
++
++#include <util/log.h>
++#include <util/string_utils.h>
++
++#include <pugixml.hpp>
++
++#include <algorithm>
++
++namespace {
++
++std::string file_name_of(const std::string &bin) {
++    const auto pos = bin.find_last_of("/\\:");
++    return pos == std::string::npos ? bin : bin.substr(pos + 1);
++}
++
++} // namespace
++
++std::string PatchEntry::key() const {
++    return (title_ids.empty() ? std::string{} : title_ids.front()) + '|' + app_ver + '|' + app_elf + '|' + nid + '|' + name;
++}
++
++fs::path patchlist_xml_path(const fs::path &patch_dir) {
++    return patch_dir / "patchlist.xml";
++}
++
++fs::path patch_config_path(const fs::path &patch_dir) {
++    return patch_dir / "patch_config.xml";
++}
++
++bool parse_patch_entries(const std::string &xml, PatchEntries &entries) {
++    pugi::xml_document doc;
++    if (!doc.load_buffer(xml.data(), xml.size()))
++        return false;
++
++    const auto root = doc.child("Patch");
++    if (!root)
++        return false;
++
++    std::vector<std::string> title_ids;
++    for (const auto node : root.children()) {
++        const std::string_view tag = node.name();
++        if (tag == "TitleID") {
++            title_ids.clear();
++            for (const auto id : node.children("ID"))
++                title_ids.emplace_back(id.text().as_string());
++            continue;
++        }
++        if (tag != "Metadata")
++            continue;
++
++        PatchEntry entry;
++        entry.title_ids = title_ids;
++        entry.title = node.attribute("Title").as_string();
++        entry.name = node.attribute("Name").as_string();
++        entry.author = node.attribute("Author").as_string();
++        entry.note = node.attribute("Note").as_string();
++        entry.patch_ver = node.attribute("PatchVer").as_string();
++        entry.app_ver = node.attribute("AppVer").as_string();
++        entry.app_elf = node.attribute("AppElf").as_string("eboot.bin");
++        entry.nid = node.attribute("NID").as_string();
++
++        for (const auto line : node.child("PatchList").children("Line")) {
++            const std::string type = line.attribute("Type").as_string();
++            Patch patch{};
++            const auto values = parse_value(line.attribute("Value").as_string());
++            if (type != "bytes" || !values || !parse_address(line.attribute("Address").as_string(), patch.seg, patch.offset)) {
++                LOG_WARN("Skipping unsupported patch line in {} ({}): type={} address={}", entry.title, entry.name, type, line.attribute("Address").as_string());
++                continue;
++            }
++            patch.values = *values;
++            entry.patches.push_back(std::move(patch));
++        }
++        entries.push_back(std::move(entry));
++    }
++
++    return true;
++}
++
++PatchEntries load_patch_entries(const fs::path &patch_dir) {
++    std::vector<char> buffer;
++    PatchEntries entries;
++    const auto path = patchlist_xml_path(patch_dir);
++    if (!fs_utils::read_data(path, buffer))
++        return entries;
++
++    if (!parse_patch_entries(std::string(buffer.begin(), buffer.end()), entries))
++        LOG_ERROR("Failed to parse {}", fs_utils::path_to_utf8(path));
++    return entries;
++}
++
++EnabledPatches load_enabled_patches(const fs::path &patch_dir) {
++    EnabledPatches enabled;
++    pugi::xml_document doc;
++    if (!doc.load_file(patch_config_path(patch_dir).c_str()))
++        return enabled;
++
++    for (const auto node : doc.child("PatchConfig").children("Enabled"))
++        enabled.insert(node.attribute("Key").as_string());
++    return enabled;
++}
++
++bool save_enabled_patches(const fs::path &patch_dir, const EnabledPatches &enabled) {
++    pugi::xml_document doc;
++    auto root = doc.append_child("PatchConfig");
++    for (const auto &key : enabled)
++        root.append_child("Enabled").append_attribute("Key").set_value(key.c_str());
++    return doc.save_file(patch_config_path(patch_dir).c_str());
++}
++
++bool patch_entry_matches(const PatchEntry &entry, const std::string &titleid, const std::string &bin, const std::string &app_ver, uint32_t nid) {
++    if (std::find(entry.title_ids.begin(), entry.title_ids.end(), titleid) == entry.title_ids.end())
++        return false;
++
++    if (string_utils::tolower(file_name_of(bin)) != string_utils::tolower(file_name_of(entry.app_elf)))
++        return false;
++
++    if (!entry.app_ver.empty() && !patch_versions_equal(entry.app_ver, app_ver))
++        return false;
++
++    const auto expected = parse_hex(entry.nid);
++    return expected && *expected == nid;
++}
++
++Patches get_xml_patches(const fs::path &patch_dir, const std::string &titleid, const std::string &bin, const std::string &app_ver, uint32_t nid) {
++    Patches patches;
++    const auto enabled = load_enabled_patches(patch_dir);
++    if (enabled.empty())
++        return patches;
++
++    for (const auto &entry : load_patch_entries(patch_dir)) {
++        if (!enabled.contains(entry.key()) || !patch_entry_matches(entry, titleid, bin, app_ver, nid))
++            continue;
++
++        LOG_INFO("Enabled patch: {} ({} {})", entry.title, entry.name, entry.patch_ver);
++        patches.insert(patches.end(), entry.patches.begin(), entry.patches.end());
++    }
++
++    return patches;
++}
+diff --git a/vita3k/patch/src/util.cpp b/vita3k/patch/src/util.cpp
+index 65b6ad2e..3288f9d2 100644
+--- a/vita3k/patch/src/util.cpp
++++ b/vita3k/patch/src/util.cpp
+@@ -17,9 +17,124 @@
+ 
+ #include "patch/util.h"
+ 
++#include <algorithm>
++#include <cctype>
++#include <charconv>
+ #include <map>
++#include <optional>
++#include <string_view>
+ #include <util/log.h>
+ 
++std::optional<uint64_t> parse_hex(std::string_view text) {
++    if (text.starts_with("0x") || text.starts_with("0X"))
++        text.remove_prefix(2);
++    uint64_t value = 0;
++    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value, 16);
++    if (text.empty() || ec != std::errc{} || end != text.data() + text.size())
++        return std::nullopt;
++    return value;
++}
++
++namespace {
++
++std::optional<std::vector<uint8_t>> parse_hex_bytes(const std::string &text) {
++    std::string digits;
++    for (size_t pos = 0; pos < text.size();) {
++        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])))
++            ++pos;
++        const size_t start = pos;
++        while (pos < text.size() && !std::isspace(static_cast<unsigned char>(text[pos])))
++            ++pos;
++        std::string token = text.substr(start, pos - start);
++        if (token.starts_with("0x") || token.starts_with("0X"))
++            token.erase(0, 2);
++        if (token.size() % 2)
++            token.insert(token.begin(), '0');
++        digits += token;
++    }
++
++    if (digits.empty())
++        return std::nullopt;
++
++    std::vector<uint8_t> bytes;
++    bytes.reserve(digits.size() / 2);
++    for (size_t i = 0; i < digits.size(); i += 2) {
++        const auto byte = parse_hex(std::string_view(digits).substr(i, 2));
++        if (!byte)
++            return std::nullopt;
++        bytes.push_back(static_cast<uint8_t>(*byte));
++    }
++    return bytes;
++}
++
++std::optional<int64_t> parse_number(std::string_view text) {
++    if (text.starts_with("0x") || text.starts_with("0X")) {
++        const auto value = parse_hex(text);
++        return value ? std::optional<int64_t>(static_cast<int64_t>(*value)) : std::nullopt;
++    }
++    int64_t value = 0;
++    const auto [end, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
++    if (text.empty() || ec != std::errc{} || end != text.data() + text.size())
++        return std::nullopt;
++    return value;
++}
++
++// Evaluates "a + b - c" over decimal or 0x numbers; vblank is fixed to 1 (60Hz)
++std::optional<uint32_t> evaluate_expression(const std::string &expression) {
++    int64_t total = 0;
++    int sign = 1;
++    size_t pos = 0;
++    bool expect_number = true;
++    while (pos < expression.size()) {
++        const char c = expression[pos];
++        if (std::isspace(static_cast<unsigned char>(c))) {
++            ++pos;
++        } else if (!expect_number && (c == '+' || c == '-')) {
++            sign = c == '+' ? 1 : -1;
++            expect_number = true;
++            ++pos;
++        } else if (expect_number) {
++            size_t end = pos;
++            while (end < expression.size() && !std::isspace(static_cast<unsigned char>(expression[end])) && expression[end] != '+' && expression[end] != '-')
++                ++end;
++            const std::string_view token = std::string_view(expression).substr(pos, end - pos);
++            const auto value = token == "vblank" ? std::optional<int64_t>(1) : parse_number(token);
++            if (!value)
++                return std::nullopt;
++            total += sign * *value;
++            expect_number = false;
++            pos = end;
++        } else {
++            return std::nullopt;
++        }
++    }
++    if (expect_number)
++        return std::nullopt;
++    return static_cast<uint32_t>(total);
++}
++
++std::optional<std::vector<uint8_t>> encode_instruction(std::string name, const std::string &args_text) {
++    if (to_instruction(name) == Instruction::INVALID)
++        return std::nullopt;
++
++    std::vector<uint32_t> args;
++    size_t pos = 0;
++    while (!args_text.empty() && pos <= args_text.size()) {
++        const auto comma = args_text.find(',', pos);
++        const auto arg = evaluate_expression(args_text.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos));
++        if (!arg)
++            return std::nullopt;
++        args.push_back(*arg);
++        if (comma == std::string::npos)
++            break;
++        pos = comma + 1;
++    }
++
++    return to_bytes(translate(name, args), 0);
++}
++
++} // namespace
++
+ // This function will return a PatchHeader struct, which contains the titleid and the binary name (if provided)
+ PatchHeader read_header(std::string &header, bool is_patchlist) {
+     PatchHeader patch_header;
+@@ -158,3 +273,86 @@ uint32_t translate(std::string &inst, std::vector<uint32_t> &args) {
+ 
+     return 0;
+ }
++
++// Value is a list of hex byte strings and instructions such as "t1_mov(1, 4 - 1)"
++std::optional<std::vector<uint8_t>> parse_value(const std::string &text) {
++    std::vector<uint8_t> bytes;
++    size_t pos = 0;
++    while (pos < text.size()) {
++        if (std::isspace(static_cast<unsigned char>(text[pos]))) {
++            ++pos;
++            continue;
++        }
++
++        size_t end = pos;
++        while (end < text.size() && !std::isspace(static_cast<unsigned char>(text[end])) && text[end] != '(')
++            ++end;
++
++        std::optional<std::vector<uint8_t>> chunk;
++        if (end < text.size() && text[end] == '(') {
++            const auto close = text.find(')', end);
++            if (close == std::string::npos)
++                return std::nullopt;
++            chunk = encode_instruction(text.substr(pos, end - pos), text.substr(end + 1, close - end - 1));
++            end = close + 1;
++        } else {
++            chunk = parse_hex_bytes(text.substr(pos, end - pos));
++        }
++
++        if (!chunk)
++            return std::nullopt;
++        bytes.insert(bytes.end(), chunk->begin(), chunk->end());
++        pos = end;
++    }
++
++    if (bytes.empty())
++        return std::nullopt;
++    return bytes;
++}
++
++// Address is "<offset>" in segment 0 or "<segment>:<offset>"
++bool parse_address(const std::string &address, uint8_t &seg, uint32_t &offset) {
++    std::string_view offset_text = address;
++    seg = 0;
++    if (const auto colon = address.find(':'); colon != std::string::npos) {
++        const auto seg_value = parse_hex(std::string_view(address).substr(0, colon));
++        if (!seg_value || *seg_value > 0xFF)
++            return false;
++        seg = static_cast<uint8_t>(*seg_value);
++        offset_text = std::string_view(address).substr(colon + 1);
++    }
++
++    const auto offset_value = parse_hex(offset_text);
++    if (!offset_value || *offset_value > UINT32_MAX)
++        return false;
++    offset = static_cast<uint32_t>(*offset_value);
++    return true;
++}
++
++// Versions are compared per component so that "1.02" equals "01.02"
++bool patch_versions_equal(const std::string &a, const std::string &b) {
++    const auto split = [](const std::string &version) -> std::optional<std::vector<int>> {
++        std::vector<int> parts;
++        size_t pos = 0;
++        while (pos <= version.size()) {
++            const auto dot = version.find('.', pos);
++            const std::string part = version.substr(pos, dot == std::string::npos ? std::string::npos : dot - pos);
++            int value = 0;
++            const auto [end, ec] = std::from_chars(part.data(), part.data() + part.size(), value);
++            if (part.empty() || ec != std::errc{} || end != part.data() + part.size())
++                return std::nullopt;
++            parts.push_back(value);
++            if (dot == std::string::npos)
++                break;
++            pos = dot + 1;
++        }
++        while (parts.size() > 1 && parts.back() == 0)
++            parts.pop_back();
++        return parts;
++    };
++    const auto parts_a = split(a);
++    const auto parts_b = split(b);
++    if (!parts_a || !parts_b)
++        return a == b;
++    return *parts_a == *parts_b;
++}
+diff --git a/vita3k/util/include/util/fs.h b/vita3k/util/include/util/fs.h
+index 5b8c2f08..df8e93a0 100644
+--- a/vita3k/util/include/util/fs.h
++++ b/vita3k/util/include/util/fs.h
+@@ -75,7 +75,7 @@ fs::path path_concat(const fs::path &path1, const fs::path &path2);
+  * \param data pointer to data buffer
+  * \param size size of data buffer in bytes
+  */
+-void dump_data(const fs::path &path, const void *data, const std::streamsize size);
++bool dump_data(const fs::path &path, const void *data, const std::streamsize size);
+ 
+ bool read_data(const fs::path &path, std::vector<uint8_t> &data);
+ bool read_data(const fs::path &path, std::vector<int8_t> &data);
+diff --git a/vita3k/util/src/fs_utils.cpp b/vita3k/util/src/fs_utils.cpp
+index b2f8196d..85659f03 100644
+--- a/vita3k/util/src/fs_utils.cpp
++++ b/vita3k/util/src/fs_utils.cpp
+@@ -50,12 +50,13 @@ fs::path path_concat(const fs::path &path1, const fs::path &path2) {
+     return fs::path{ path1.native() + path2.native() };
+ }
+ 
+-void dump_data(const fs::path &path, const void *data, const std::streamsize size) {
++bool dump_data(const fs::path &path, const void *data, const std::streamsize size) {
+     fs::ofstream of{ path, fs::ofstream::binary };
+-    if (!of.fail()) {
+-        of.write(static_cast<const char *>(data), size);
+-        of.close();
+-    }
++    if (of.fail())
++        return false;
++    of.write(static_cast<const char *>(data), size);
++    of.close();
++    return !of.fail();
+ }
+ template <typename T>
+ static bool read_data(const fs::path &path, std::vector<T> &data) {
+-- 
+2.54.0.windows.1
+

@@ -1,0 +1,83 @@
+From 2262eddeebeb2264192ceff125fde84cb6c96540 Mon Sep 17 00:00:00 2001
+From: BreDoyliesSea <doylies@encrypt.eu>
+Date: Fri, 23 Oct 2026 09:11:40 -0600
+Subject: [PATCH 57/58] cpu: End a guest function that is executing in the
+ first page (#4290)
+
+* cpu: End a guest function that is executing in the first page
+
+A thread whose PC is in the first page has jumped through a null or wiped
+pointer. Every instruction fetch there was an invalid read that returned
+0, which decodes as a plain instruction, so the JIT went on translating
+one block through unmapped memory, logging each fetch, until the
+emulator was closed.
+
+A fetch from the first page now fails, so the block ends in a no-execute
+fault, and the fault ends the thread's guest function the way
+WaitForInterrupt does: the thread returns instead of spinning there.
+Suggested in review of #4198.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* cpu: Check the Vita's first page and log the stopped thread's state
+
+The first page is the Vita's 4 KiB one, not the host's, which can be
+larger. The stop now logs the thread's registers too, as the invalid
+read and write reports do.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* ci: Expect gxm_shader_patcher_memory to fail instead of timing out
+
+Its NULL host alloc callback still jumps to 0, but the thread is now
+stopped there, so the test finishes and fails on the patcher regions and
+error codes instead of timing out.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* ci: Keep gxm_shader_patcher_memory's reason as it was
+
+Only its expected result changes, from timeout to fail.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+
+* Change gxm_shader_patcher_memory status to timeout
+
+---------
+
+Co-authored-by: Claude Opus 5.5 <noreply@anthropic.com>
+Co-authored-by: Pedro Montes Alcalde <pedro.montes.alcalde@gmail.com>
+(cherry picked from commit 6fe288365065987681adcfd1daad2a64f3b29846)
+---
+ vita3k/cpu/src/dynarmic_cpu.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/vita3k/cpu/src/dynarmic_cpu.cpp b/vita3k/cpu/src/dynarmic_cpu.cpp
+index 9e4b7606..fcbfcac5 100644
+--- a/vita3k/cpu/src/dynarmic_cpu.cpp
++++ b/vita3k/cpu/src/dynarmic_cpu.cpp
+@@ -168,6 +168,8 @@ public:
+     std::optional<std::uint32_t> MemoryReadCode(Dynarmic::A32::VAddr addr) override {
+         if (cpu->log_mem)
+             LOG_TRACE("Instruction fetch at address 0x{:X}", addr);
++        if (addr < KiB(4))
++            return std::nullopt;
+         return MemoryRead32(addr);
+     }
+ 
+@@ -339,6 +341,12 @@ public:
+             cpu->jit->HaltExecution();
+             break;
+         }
++        case Dynarmic::A32::Exception::NoExecuteFault: {
++            LOG_CRITICAL("PC is 0x{:x}, stopping thread {}\n{}", pc, parent->thread_id, this->cpu->save_context().description());
++            cpu->halted = true;
++            cpu->jit->HaltExecution();
++            break;
++        }
+         case Dynarmic::A32::Exception::PreloadDataWithIntentToWrite:
+         case Dynarmic::A32::Exception::PreloadData:
+         case Dynarmic::A32::Exception::PreloadInstruction:
+-- 
+2.54.0.windows.1
+

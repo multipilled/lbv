@@ -1,0 +1,43 @@
+From 495d245eb1614832fa73657ff586ab75f5398a80 Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 00:02:47 -0400
+Subject: [PATCH 62/62] debug aid: VITA3K_VCOUNT_MAX caps
+ sceDisplayWaitSetFrameBufMulti's vcount; the first vcount is logged
+
+---
+ vita3k/modules/SceDisplay/SceDisplay.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
+index 430db707e..17507e4c0 100644
+--- a/vita3k/modules/SceDisplay/SceDisplay.cpp
++++ b/vita3k/modules/SceDisplay/SceDisplay.cpp
+@@ -15,6 +15,8 @@
+ // with this program; if not, write to the Free Software Foundation, Inc.,
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
++#include <cstdlib>
++#include <mutex>
+ #include "SceDisplay.h"
+ 
+ #include <display/functions.h>
+@@ -234,6 +236,16 @@ EXPORT(SceInt32, sceDisplayWaitSetFrameBufCB) {
+ 
+ EXPORT(SceInt32, sceDisplayWaitSetFrameBufMulti, SceUInt vcount) {
+     TRACY_FUNC(sceDisplayWaitSetFrameBufMulti, vcount);
++    // VITA3K_VCOUNT_MAX=<n>: wait at most n vblanks here, e.g. 1 to see whether a game paced at 30 fps by
++    // this wait keeps its speed at 60 (frame-rate studies; debugging aid). The first vcount is logged.
++    static const int vcount_max = [] {
++        const char *v = std::getenv("VITA3K_VCOUNT_MAX");
++        return v ? std::atoi(v) : 0;
++    }();
++    static std::once_flag logged;
++    std::call_once(logged, [&] { LOG_INFO("sceDisplayWaitSetFrameBufMulti: vcount {} (cap {})", vcount, vcount_max); });
++    if (vcount_max > 0 && static_cast<int>(vcount) > vcount_max)
++        vcount = vcount_max;
+     return display_wait(emuenv, thread_id, static_cast<int>(vcount), true, false);
+ }
+ 
+-- 
+2.54.0.windows.1
+

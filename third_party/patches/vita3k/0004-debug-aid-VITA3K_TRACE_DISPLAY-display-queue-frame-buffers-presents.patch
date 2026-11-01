@@ -1,0 +1,104 @@
+diff --git a/vita3k/display/include/display/state.h b/vita3k/display/include/display/state.h
+index 9eb72d70..628d0e39 100644
+--- a/vita3k/display/include/display/state.h
++++ b/vita3k/display/include/display/state.h
+@@ -23,6 +23,8 @@
+ #include <util/types.h>
+ 
+ #include <atomic>
++#include <cstdio>
++#include <cstdlib>
+ #include <memory>
+ #include <mutex>
+ #include <thread>
+@@ -95,3 +97,17 @@ struct DisplayState {
+ 
+     void deinit();
+ };
++
++// VITA3K_TRACE_DISPLAY=<first vblank>,<last vblank>: between those vblanks (60 a second), log the display queue
++// entries, sceDisplaySetFrameBuf calls and the frames given to the presenter (debugging aid: frames that show the
++// wrong buffer)
++inline bool display_trace_on(const DisplayState &display) {
++    static const auto range = [] {
++        unsigned long long first = 0, last = 0;
++        if (const char *v = std::getenv("VITA3K_TRACE_DISPLAY"))
++            std::sscanf(v, "%llu,%llu", &first, &last);
++        return std::pair<uint64_t, uint64_t>(first, last);
++    }();
++    const uint64_t vblank = display.vblank_count.load(std::memory_order_relaxed);
++    return range.second && vblank >= range.first && vblank < range.second;
++}
+diff --git a/vita3k/modules/SceDisplay/SceDisplay.cpp b/vita3k/modules/SceDisplay/SceDisplay.cpp
+index a75dafbd..1239227b 100644
+--- a/vita3k/modules/SceDisplay/SceDisplay.cpp
++++ b/vita3k/modules/SceDisplay/SceDisplay.cpp
+@@ -147,6 +147,10 @@ EXPORT(SceInt32, _sceDisplaySetFrameBuf, const SceDisplayFrameBuf *pFrameBuf, Sc
+         STUBBED("SCE_DISPLAY_SETBUF_IMMEDIATE is not supported");
+     }
+ 
++    if (display_trace_on(emuenv.display))
++        LOG_INFO("display: vblank {} set frame buf {} {}x{} pitch {}{}, predicting {}", emuenv.display.vblank_count.load(),
++            log_hex(pFrameBuf->base.address()), pFrameBuf->width, pFrameBuf->height, pFrameBuf->pitch,
++            sync == SCE_DISPLAY_SETBUF_IMMEDIATE ? " immediate" : "", emuenv.display.predicting.load());
+     DisplayFrameInfo &info = emuenv.display.sce_frame;
+ 
+     info.base = pFrameBuf->base;
+diff --git a/vita3k/modules/SceGxm/SceGxm.cpp b/vita3k/modules/SceGxm/SceGxm.cpp
+index 9de83527..08a85121 100644
+--- a/vita3k/modules/SceGxm/SceGxm.cpp
++++ b/vita3k/modules/SceGxm/SceGxm.cpp
+@@ -939,6 +939,8 @@ static void display_entry_thread(EmuEnvState &emuenv) {
+ 
+         // Now run callback
+         display_thread->run_guest_function(callback_address, display_callback->data);
++        if (display_trace_on(emuenv.display))
++            LOG_INFO("display: vblank {} callback done for new sync {}", emuenv.display.vblank_count.load(), log_hex(display_callback->new_sync.address()));
+ 
+         // Notifies the renderer of the completion of the callback for the display_entry.
+         // The last_display of the entry, when pushed into the queue, is guaranteed to be timestamp_ahead + 1 at the time of the call.
+@@ -2292,6 +2294,9 @@ EXPORT(int, sceGxmDisplayQueueAddEntry, Ptr<SceGxmSyncObject> oldBuffer, Ptr<Sce
+     memcpy(ptr.get(emuenv.mem), callbackData.get(emuenv.mem), emuenv.gxm.params.displayQueueCallbackDataSize);
+ 
+     DisplayFrameInfo *frame = predict_next_image(emuenv, newBuffer.address());
++    if (display_trace_on(emuenv.display))
++        LOG_INFO("display: vblank {} queue entry, old sync {} new sync {}, predicted frame {}", emuenv.display.vblank_count.load(),
++            log_hex(oldBuffer.address()), log_hex(newBuffer.address()), frame ? log_hex(frame->base.address()) : "none");
+ 
+     // Block future rendering by setting values of sync object
+     SceGxmSyncObject *oldBufferSync = oldBuffer.get(emuenv.mem);
+diff --git a/vita3k/renderer/src/sync.cpp b/vita3k/renderer/src/sync.cpp
+index 684c12ca..38ec49cf 100644
+--- a/vita3k/renderer/src/sync.cpp
++++ b/vita3k/renderer/src/sync.cpp
+@@ -23,6 +23,7 @@
+ #include <renderer/types.h>
+ 
+ #include <display/state.h>
++#include <util/log.h>
+ #include <renderer/gl/functions.h>
+ #include <renderer/gl/state.h>
+ #include <renderer/vulkan/functions.h>
+@@ -98,6 +99,8 @@ COMMAND(new_frame) {
+         // set the predicted frame as the next one to render
+         std::lock_guard<std::mutex> guard(display->display_info_mutex);
+         display->next_rendered_frame = *next_frame;
++        if (display_trace_on(*display))
++            LOG_INFO("display: vblank {} GPU reached the predicted frame {}", display->vblank_count.load(), log_hex(next_frame->base.address()));
+         delete next_frame;
+ 
+         renderer.should_display = true;
+diff --git a/vita3k/renderer/src/vulkan/renderer.cpp b/vita3k/renderer/src/vulkan/renderer.cpp
+index 035d16a3..ceebe8bb 100644
+--- a/vita3k/renderer/src/vulkan/renderer.cpp
++++ b/vita3k/renderer/src/vulkan/renderer.cpp
+@@ -1221,6 +1221,9 @@ void VKState::render_frame(DisplayState &display, const GxmState &gxm, MemState
+         vk::ImageLayout layout = vk::ImageLayout::eGeneral;
+         vk::ImageView surface_handle = surface_cache.sourcing_color_surface_for_presentation(
+             frame.base, frame.pitch, viewport);
++        if (display_trace_on(display))
++            LOG_INFO("display: vblank {} present {} from {}", display.vblank_count.load(), log_hex(frame.base.address()),
++                surface_handle ? "its colour surface" : "memory");
+ 
+         if (!surface_handle) {
+             vkutil::Image &vita_surface = screen_renderer.vita_surface[screen_renderer.swapchain_image_idx];

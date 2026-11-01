@@ -1,0 +1,268 @@
+From af038d71b845478c8d4d07c7a1788a977ef7f7b9 Mon Sep 17 00:00:00 2001
+From: multipilled <336802225+multipilled@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 23:56:38 -0400
+Subject: [PATCH 61/62] lbv: save import/export (--import-save, --export-save,
+ --quiet), touch help in lbv.ini
+
+---
+ vita3k/CMakeLists.txt      |  2 +-
+ vita3k/games/lbv/main.cpp  | 52 ++++++++++++++++++--
+ vita3k/games/lbv/saves.cpp | 97 ++++++++++++++++++++++++++++++++++++++
+ vita3k/games/lbv/saves.h   | 40 ++++++++++++++++
+ 4 files changed, 187 insertions(+), 4 deletions(-)
+ create mode 100644 vita3k/games/lbv/saves.cpp
+ create mode 100644 vita3k/games/lbv/saves.h
+
+diff --git a/vita3k/CMakeLists.txt b/vita3k/CMakeLists.txt
+index 3fcdd57dd..40bddeb45 100644
+--- a/vita3k/CMakeLists.txt
++++ b/vita3k/CMakeLists.txt
+@@ -530,5 +530,5 @@ if(WIN32)
+ 	# Killzone Mercenary (PCSF00403)
+ 	add_game(vekta-mercenary games/vekta-mercenary/main.cpp)
+ 	# LittleBigPlanet PS Vita (PCSA00549), the LBV project
+-	add_game(lbv games/lbv/main.cpp)
++	add_game(lbv games/lbv/main.cpp games/lbv/saves.cpp games/lbv/saves.h)
+ endif()
+diff --git a/vita3k/games/lbv/main.cpp b/vita3k/games/lbv/main.cpp
+index 672747409..0141ae505 100644
+--- a/vita3k/games/lbv/main.cpp
++++ b/vita3k/games/lbv/main.cpp
+@@ -18,15 +18,17 @@
+ // lbv.exe: LittleBigPlanet PS Vita (Marvel Super Hero Edition, NA, PCSA00549) on the shared
+ // single-game frontend (game-frontend/profile.h). The LBV project's docs describe the port.
+ //
+-// Milestone M0 of that project: the game's profile and settings file only, so the game can be
+-// installed, its modules written (--dump-elfs) and booted on the JIT. No game-specific fixes yet.
++// The game's profile, its settings file (lbv.ini), base-2 shader EXP/LOG (M3c) and save import/export (M4).
+ 
+ #include "../../game-frontend/profile.h"
++#include "saves.h"
+ 
+ #include <config/state.h>
++#include <util/log.h>
+ 
+ // provides WinMain for the windowed executable, which calls main below
+ #include <SDL3/SDL_main.h>
++#include <SDL3/SDL_messagebox.h>
+ 
+ namespace {
+ 
+@@ -48,14 +50,28 @@ game_frontend::IniLayout ini_layout() {
+             layout::debug(id),
+             layout::keyboard(),
+             layout::gamepad(),
+-            layout::touch("; None yet.\n"),
++            layout::touch("; The left mouse button touches the front screen and the right button the rear one, at the\n"
++                          "; pointer: LBP uses the front pad to pick and drag in the Popit and create mode, and the rear\n"
++                          "; pad to push some level objects out of the background.\n"
++                          "; No named touches by default.\n"),
+         },
+     };
+ }
+ 
++// --import-save / --export-save
++struct SaveCommand {
++    std::string import_from, export_to;
++    bool quiet = false;
++};
++
+ } // namespace
+ 
+ int main(int argc, char *argv[]) {
++    // the game's own command line, besides the frontend's (game-frontend/frontend.cpp):
++    //   --import-save <folder> copy a save folder in (PCSA00017 or the folder above it), keeping the old one
++    //   --export-save <folder> copy the save folder out
++    //   --quiet                no message box for the two above (the result is in the log)
++    SaveCommand save;
+     game_frontend::Profile profile;
+     profile.title_id = TITLE_ID;
+     profile.name = "LittleBigPlanet";
+@@ -66,5 +82,35 @@ int main(int argc, char *argv[]) {
+         // (M3c in the LBV docs, docs/formats/render-m3.md)
+         cfg.exp_log_base2 = true;
+     };
++    profile.hooks.parse_arg = [&](game_frontend::Context &, const std::vector<std::string> &args, size_t &i) {
++        const std::string &arg = args[i];
++        const bool has_value = i + 1 < args.size();
++        if (arg == "--import-save" && has_value)
++            save.import_from = args[++i];
++        else if (arg == "--export-save" && has_value)
++            save.export_to = args[++i];
++        else if (arg == "--quiet")
++            save.quiet = true;
++        else
++            return false;
++        return true;
++    };
++    profile.hooks.before_init = [&](game_frontend::Context &ctx) -> std::optional<int> {
++        if (save.import_from.empty() && save.export_to.empty())
++            return std::nullopt;
++        const auto &vita_fs = ctx.settings->vita_fs;
++        std::string message;
++        const bool ok = !save.import_from.empty()
++            ? lbv::import_save(vita_fs, fs_utils::utf8_to_path(save.import_from), ctx.data_dir / "save-backups", message)
++            : lbv::export_save(vita_fs, fs_utils::utf8_to_path(save.export_to), message);
++        if (ok)
++            LOG_INFO("Save: {}", message);
++        else
++            LOG_ERROR("Save: {}", message);
++        if (!save.quiet)
++            SDL_ShowSimpleMessageBox(ok ? SDL_MESSAGEBOX_INFORMATION : SDL_MESSAGEBOX_ERROR, ctx.window_name.c_str(),
++                ("Save: " + message).c_str(), nullptr);
++        return ok ? 0 : 1;
++    };
+     return game_frontend::run(profile, argc, argv);
+ }
+diff --git a/vita3k/games/lbv/saves.cpp b/vita3k/games/lbv/saves.cpp
+new file mode 100644
+index 000000000..e0ef406a9
+--- /dev/null
++++ b/vita3k/games/lbv/saves.cpp
+@@ -0,0 +1,97 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++#include "saves.h"
++
++#include <ctime>
++
++namespace lbv {
++
++namespace {
++
++constexpr const char *SAVE_ID = "PCSA00017";
++
++std::string timestamp() {
++    const std::time_t now = std::time(nullptr);
++    char text[32];
++    std::strftime(text, sizeof(text), "%Y-%m-%d_%H-%M-%S", std::localtime(&now));
++    return text;
++}
++
++// the folder under `source` that holds output/ (source itself, or source/PCSA00017)
++fs::path find_save(const fs::path &source) {
++    if (fs::is_directory(source / "output"))
++        return source;
++    if (fs::is_directory(source / SAVE_ID / "output"))
++        return source / SAVE_ID;
++    return {};
++}
++
++} // namespace
++
++fs::path save_dir(const fs::path &vita_fs) {
++    return vita_fs / "ux0" / "user" / "00" / "savedata" / SAVE_ID;
++}
++
++bool import_save(const fs::path &vita_fs, const fs::path &source, const fs::path &backup_dir, std::string &message) {
++    const fs::path from = find_save(source);
++    if (from.empty()) {
++        message = "no LittleBigPlanet save (a folder with output/) in " + source.string();
++        return false;
++    }
++    const fs::path dir = save_dir(vita_fs);
++    boost::system::error_code ec;
++    if (fs::exists(dir)) {
++        fs::path backup = backup_dir / timestamp();
++        for (int n = 2; fs::exists(backup); n++)
++            backup = backup_dir / (timestamp() + "_" + std::to_string(n));
++        fs::create_directories(backup, ec);
++        fs::copy(dir, backup / SAVE_ID, fs::copy_options::recursive, ec);
++        if (ec) {
++            message = "could not back up the save folder to " + backup.string() + ": " + ec.message();
++            return false;
++        }
++        fs::remove_all(dir, ec);
++    }
++    fs::create_directories(dir, ec);
++    fs::copy(from, dir, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
++    if (ec) {
++        message = "could not copy " + from.string() + ": " + ec.message();
++        return false;
++    }
++    message = "imported " + from.string() + " (the old save is in " + backup_dir.string() + ")";
++    return true;
++}
++
++bool export_save(const fs::path &vita_fs, const fs::path &dest, std::string &message) {
++    const fs::path dir = save_dir(vita_fs);
++    if (!fs::is_directory(dir / "output")) {
++        message = "no save yet (" + dir.string() + ")";
++        return false;
++    }
++    boost::system::error_code ec;
++    fs::create_directories(dest / SAVE_ID, ec);
++    fs::copy(dir, dest / SAVE_ID, fs::copy_options::recursive | fs::copy_options::overwrite_existing, ec);
++    if (ec) {
++        message = "could not copy to " + dest.string() + ": " + ec.message();
++        return false;
++    }
++    message = "exported to " + (dest / SAVE_ID).string();
++    return true;
++}
++
++} // namespace lbv
+diff --git a/vita3k/games/lbv/saves.h b/vita3k/games/lbv/saves.h
+new file mode 100644
+index 000000000..48c5c048a
+--- /dev/null
++++ b/vita3k/games/lbv/saves.h
+@@ -0,0 +1,40 @@
++// Vita3K emulator project
++// Copyright (C) 2026 Vita3K team
++//
++// This program is free software; you can redistribute it and/or modify
++// it under the terms of the GNU General Public License as published by
++// the Free Software Foundation; either version 2 of the License, or
++// (at your option) any later version.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License along
++// with this program; if not, write to the Free Software Foundation, Inc.,
++// 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++
++// LittleBigPlanet PS Vita's saves on the PC: ux0:user/00/savedata/PCSA00017/ in the Vita file system (the save
++// folder every LBP Vita edition shares, the Marvel edition PCSA00549 too) holds the game's own files (output/:
++// profile, levels, the progress) and Vita3K's slot records (SlotParam_<N>.bin). The folder is copied whole.
++#pragma once
++
++#include <util/fs.h>
++
++#include <string>
++
++namespace lbv {
++
++// The save folder in the Vita file system.
++fs::path save_dir(const fs::path &vita_fs);
++
++// Copies a save folder in (the folder that holds output/, or a folder above it, e.g. an export or a save decrypted
++// on a Vita). The save folder as it was goes to `backup_dir`/<date and time>/ first. Returns false with the reason
++// in `message`.
++bool import_save(const fs::path &vita_fs, const fs::path &source, const fs::path &backup_dir, std::string &message);
++
++// Copies the save folder to `dest` (dest/PCSA00017/...).
++bool export_save(const fs::path &vita_fs, const fs::path &dest, std::string &message);
++
++} // namespace lbv
+-- 
+2.54.0.windows.1
+

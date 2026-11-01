@@ -1,0 +1,108 @@
+From f40b25cfad25038ec56ebc8ceb4801e43c6f23bb Mon Sep 17 00:00:00 2001
+From: DA <doylies@encrypt.eu>
+Date: Tue, 6 Oct 2026 08:42:08 -0600
+Subject: [PATCH 42/52] SceSysmem: Enforce the user memory budget in
+ sceKernelAllocMemBlock
+
+A block that takes from the user main partition and would take the
+allocated total past the budget sceKernelGetFreeMemorySize reports is
+refused with SCE_KERNEL_ERROR_NO_MEMORY, as on hardware.
+
+Final Fantasy X HD probed with a 512 MiB request, got 511 MiB, and took
+its development-kit path, which can abort with an out-of-memory error.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 395a1c1635b61c56b6473e24fc8733ec616546c4)
+---
+ vita3k/modules/SceSysmem/SceSysmem.cpp          | 12 +++++++++---
+ vita3k/modules/SceSysmem/SceSysmem.h            |  2 ++
+ vita3k/modules/SceSysmem/SceSysmemForDriver.cpp | 17 +++++++++++++++++
+ 3 files changed, 28 insertions(+), 3 deletions(-)
+
+diff --git a/vita3k/modules/SceSysmem/SceSysmem.cpp b/vita3k/modules/SceSysmem/SceSysmem.cpp
+index 1254227e..c60caf04 100644
+--- a/vita3k/modules/SceSysmem/SceSysmem.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmem.cpp
+@@ -251,9 +251,7 @@ EXPORT(int, sceKernelFreeMemBlockForVM, SceUID uid) {
+     return CALL_EXPORT(ksceKernelFreeMemBlock, uid);
+ }
+ 
+-EXPORT(int, sceKernelGetFreeMemorySize, SceKernelFreeMemorySizeInfo *info) {
+-    TRACY_FUNC(sceKernelGetFreeMemorySize, info);
+-
++uint32_t get_max_user_memory(EmuEnvState &emuenv) {
+     // Default memory configuration
+     uint32_t max_user = MiB(256);
+ 
+@@ -279,6 +277,14 @@ EXPORT(int, sceKernelGetFreeMemorySize, SceKernelFreeMemorySizeInfo *info) {
+     } else
+         LOG_WARN_ONCE("ATTRIBUTE2 key not found in SFO data.");
+ 
++    return max_user;
++}
++
++EXPORT(int, sceKernelGetFreeMemorySize, SceKernelFreeMemorySizeInfo *info) {
++    TRACY_FUNC(sceKernelGetFreeMemorySize, info);
++
++    const uint32_t max_user = get_max_user_memory(emuenv);
++
+     // Define other memory limits
+     constexpr uint32_t max_cdram = MiB(112); // Max cdram memory (112 MiB)
+     constexpr uint32_t max_phycont = MiB(26); // Max physically contiguous memory (26 MiB)
+diff --git a/vita3k/modules/SceSysmem/SceSysmem.h b/vita3k/modules/SceSysmem/SceSysmem.h
+index 997b13a8..55262e1d 100644
+--- a/vita3k/modules/SceSysmem/SceSysmem.h
++++ b/vita3k/modules/SceSysmem/SceSysmem.h
+@@ -19,5 +19,7 @@
+ 
+ #include <module/module.h>
+ 
++uint32_t get_max_user_memory(EmuEnvState &emuenv);
++
+ DECL_EXPORT(SceUID, sceKernelFindMemBlockByAddr, Address addr, uint32_t size);
+ DECL_EXPORT(int, sceKernelFreeMemBlock, SceUID uid);
+diff --git a/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp b/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
+index a6d80f27..2b6eddb1 100644
+--- a/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
++++ b/vita3k/modules/SceSysmem/SceSysmemForDriver.cpp
+@@ -16,6 +16,7 @@
+ // 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ 
+ #include "SceSysmemForDriver.h"
++#include "SceSysmem.h"
+ #include <modules/sysmem_state.h>
+ 
+ #include <kernel/state.h>
+@@ -118,6 +119,19 @@ static void count_block(SysmemState &state, SceKernelMemBlockType type, SceSSize
+     }
+ }
+ 
++static bool takes_from_user(SceKernelMemBlockType type) {
++    if ((type & MEMBLOCK_TYPE_PARTITION_INDEX_MASK) == MEMBLOCK_TYPE_PARTITION_INDEX_USER_CDIALOG)
++        return false;
++    switch (type & MEMBLOCK_TYPE_PHYMEMPART_MASK) {
++    case MEMBLOCK_TYPE_PHYMEMPART_CDRAM:
++    case MEMBLOCK_TYPE_PHYMEMPART_PHYCONT:
++    case MEMBLOCK_TYPE_PHYMEMPART_CDIALOG:
++        return false;
++    default:
++        return true;
++    }
++}
++
+ SceUID add_block(SysmemState &state, const char *name, SceKernelMemBlockType type, Address base, SceSize size) {
+     const SceUID uid = state.get_next_uid();
+     const auto block = std::make_shared<KernelMemBlock>();
+@@ -164,6 +178,9 @@ EXPORT(SceUID, ksceKernelAllocMemBlock, const char *name, SceKernelMemBlockType
+     const auto state = emuenv.kernel.obj_store.get<SysmemState>();
+     const auto guard = std::lock_guard<std::mutex>(state->mutex);
+ 
++    if (takes_from_user(type) && (static_cast<uint64_t>(state->allocated_user) + size > get_max_user_memory(emuenv)))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++
+     Ptr<void> address;
+     if (base_address) {
+         Address addr = alloc_at(mem, base_address, size, name);
+-- 
+2.54.0.windows.1
+

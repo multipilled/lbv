@@ -1,0 +1,89 @@
+From 1454b8ec9710daec075120d3677d993bbf4b840f Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=20=28=E3=82=BB=E3=83=AB=E3=82=B8=29?=
+ <xerpi.g.12@gmail.com>
+Date: Thu, 8 Oct 2026 20:34:12 +0900
+Subject: [PATCH 11/52] kernel: return the message pipe empty and full errors
+
+- sceKernelTryReceiveMsgPipe returns SCE_KERNEL_ERROR_MSG_PIPE_EMPTY on an empty pipe,
+  instead of the unrelated 0x800201b4
+- sceKernelTrySendMsgPipe returns SCE_KERNEL_ERROR_MSG_PIPE_FULL on a full pipe,
+  instead of success with a size of 0
+
+(cherry picked from commit bfae970a48e4d0bdf0f488fb81674245afa7caa6)
+---
+ vita3k/kernel/include/kernel/types.h         |  1 -
+ vita3k/kernel/src/sync_primitives.cpp        |  4 ++--
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp | 11 +----------
+ 3 files changed, 3 insertions(+), 13 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index ecb59b50..3073f009 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -438,7 +438,6 @@ enum SceKernelErrorCode : uint32_t {
+     SCE_KERNEL_ERROR_PRELOAD_FIOS2_FAILED = 0x8002D0F2,
+     SCE_KERNEL_ERROR_AUTHFAIL = 0x8002F000,
+     SCE_KERNEL_ERROR_NO_AUTH = 0x8002F001,
+-    SCE_KERNEL_ERROR_MPP_EMPTY = 0x800201b4
+ };
+ 
+ enum SceEventFlagWaitTypes {
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index eed6b4b2..4c244425 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -961,7 +961,7 @@ std::expected<SceSize, SceInt32> MsgPipe::receive(const ThreadStatePtr &thread,
+ 
+     if (!can_receive()) {
+         if (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT)
+-            return 0;
++            return std::unexpected(SCE_KERNEL_ERROR_MSG_PIPE_EMPTY);
+ 
+         // sleep until we can read, if ASAP we can read as low as 1 byte
+         const WaitEntry entry{ .request_size = ASAP ? 1 : size };
+@@ -1000,7 +1000,7 @@ std::expected<SceSize, SceInt32> MsgPipe::send(const ThreadStatePtr &thread, Sce
+ 
+     if (!can_send()) {
+         if (wait_mode & SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT)
+-            return 0;
++            return std::unexpected(SCE_KERNEL_ERROR_MSG_PIPE_FULL);
+ 
+         // sleep until there's more space, if ASAP we can insert as low as 1 byte
+         const WaitEntry entry{ .request_size = ASAP ? 1 : size };
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index eddf3ced..12c62b47 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1805,8 +1805,6 @@ EXPORT(int, sceKernelTryReceiveMsgPipe, SceUID msgpipe_id, char *recv_buf, SceSi
+     const auto size = msgpipe->receive(emuenv.kernel.get_thread(thread_id), wait_mode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, recv_buf, msg_size, nullptr, false);
+     if (!size)
+         return size.error();
+-    if (*size == 0)
+-        return SCE_KERNEL_ERROR_MSG_PIPE_EMPTY;
+     if (result)
+         *result = *size;
+     return SCE_KERNEL_OK;
+@@ -1819,19 +1817,12 @@ EXPORT(int, sceKernelTryReceiveMsgPipeVector) {
+ 
+ EXPORT(int, sceKernelTrySendMsgPipe, SceUID msgPipeId, const void *pSendBuf, SceSize sendSize, SceUInt32 waitMode, SceSize *pResult) {
+     TRACY_FUNC(sceKernelTrySendMsgPipe, msgPipeId, pSendBuf, sendSize, waitMode, pResult);
+-    waitMode |= SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT;
+-    SceUInt32 pTimeout = 0;
+     const MsgPipePtr msgpipe = emuenv.kernel.objects.find<MsgPipe>(msgPipeId);
+     if (!msgpipe)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_MSG_PIPE_ID);
+-    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), waitMode, pSendBuf, sendSize, &pTimeout, false);
++    const auto size = msgpipe->send(emuenv.kernel.get_thread(thread_id), waitMode | SCE_KERNEL_MSG_PIPE_MODE_DONT_WAIT, pSendBuf, sendSize, nullptr, false);
+     if (!size)
+         return size.error();
+-    // a pipe without room: the message is not sent, and the caller is told so (it was reported as sent, and lost)
+-    if (*size == 0 && sendSize != 0) {
+-        LOG_WARN_ONCE("sceKernelTrySendMsgPipe: pipe full");
+-        return SCE_KERNEL_ERROR_MSG_PIPE_FULL;
+-    }
+     if (pResult)
+         *pResult = *size;
+     return SCE_KERNEL_OK;
+-- 
+2.54.0.windows.1
+

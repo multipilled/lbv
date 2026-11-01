@@ -1,0 +1,1055 @@
+From b6a0e9fe4afedc55cc8d7b2557e19b204f51fd52 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Sergi=E3=83=BB=E3=82=BB=E3=83=AB=E3=82=B8?=
+ <xerpi.g.12@gmail.com>
+Date: Sat, 24 Oct 2026 18:35:54 +0900
+Subject: [PATCH 45/52] kernel: timer events (#4311)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* ci: bump VitaAutotests
+
+* kernel: put simple events on a shared event base
+
+The bit pattern, the user data and the event operations move into `Event`, for timers to share.
+No behavior change.
+
+* kernel: put timers on the shared event base
+
+Timers now share the event part of simple events, and a timer event sets or pulses
+`SCE_KERNEL_EVENT_TIMER` like any event set.
+The first wait, poll or timer call that sees an event is due fires it. Waiters sleep until the
+earlier of their timeout and the next event, so the first waiter no longer watches the clock for
+the others.
+
+Timer waits and polls now take the bits asked for, a timer event during a callback ends the wait
+with `NOTIFY_CALLBACK`, and timer events are at least 200 µs apart.
+
+* kernel: keep a fired one shot timer event armed
+
+A timer event that fired once stays armed with its schedule, so a stop and a start queue it again,
+due at once, and so does a set time below the event's time.
+A start now queues an armed event after the time it has left, not after a whole interval.
+
+* kernel: implement sceKernelSetTimerTime
+
+It sets the timer's time from the clock struct and writes the old time back into it, the time
+`sceKernelSetTimerTimeWide` returns.
+
+* kernel: implement sceKernelGetTimerInfo
+
+It reports whether the timer runs, its base or its count, the armed event's schedule, interval,
+type and repeat setting, and the waiting threads.
+A cancel now keeps the timer's interval and type, and only disarms the event.
+
+* kernel: refuse NULL pointers in the timer time and base getters
+
+`sceKernelGetTimerTime` and `sceKernelGetTimerBase` return `SCE_KERNEL_ERROR_ILLEGAL_ADDR` for a
+NULL pointer instead of writing through it.
+
+* kernel: start simple events and timers with their creator's user data
+
+An event starts with the creating thread's UID in the high word of its user data and the process
+ID in the low word, the user data of the other system events.
+
+* kernel: read a stopped timer's base as 0
+
+A stopped timer has no base, so `sceKernelGetTimerBase` and its wide form now read 0 for it.
+
+* kernel: implement sceKernelGetTimerEventRemainingTime
+
+It reports how much time the armed event has left, its time minus the timer's, and returns
+`SCE_KERNEL_ERROR_EVENT_NOT_SET` when no event is armed.
+
+* kernel: fire a timer's delete event when it is deleted
+
+A timer's delete now sets `SCE_KERNEL_EVENT_DELETE` with the deleting thread's user data before
+it ends the other waits, like a simple event's. Both now share the event's delete.
+
+(cherry picked from commit 386cd93a4492d4466bcfa34d6543d1f14d80707c)
+---
+ .../kernel/include/kernel/sync_primitives.h   | 103 +++---
+ vita3k/kernel/include/kernel/types.h          |  18 +
+ vita3k/kernel/src/sync_primitives.cpp         | 334 +++++++++---------
+ .../SceKernelThreadMgr/SceThreadmgr.cpp       | 101 ++++--
+ .../modules/SceKernelThreadMgr/SceThreadmgr.h |   3 +
+ vita3k/modules/SceLibKernel/SceLibKernel.cpp  |  22 +-
+ 6 files changed, 328 insertions(+), 253 deletions(-)
+
+diff --git a/vita3k/kernel/include/kernel/sync_primitives.h b/vita3k/kernel/include/kernel/sync_primitives.h
+index 2b4518ec..4046d91c 100644
+--- a/vita3k/kernel/include/kernel/sync_primitives.h
++++ b/vita3k/kernel/include/kernel/sync_primitives.h
+@@ -144,32 +144,25 @@ constexpr SceUInt64 system_event_user_data(SceUID thread_id) {
+     return (static_cast<SceUInt64>(thread_id) << 32) | static_cast<SceUInt32>(PROCESS_ID);
+ }
+ 
+-class SimpleEvent final : public WithUidClass<SyncPrimitive, UidClass::simple_event> {
++// The event part of simple events and timers: a bit pattern, the user data of the last set, and the
++// waits for bits of the pattern.
++class Event : public SyncPrimitive {
+ public:
+     const bool auto_reset;
+ 
+-    SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_pattern);
+-
+-    // Returns the error a create with these arguments gets, or SCE_KERNEL_OK
+-    static SceInt32 check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern);
+-
+-    SceInt32 wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks);
+     SceInt32 poll(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
+-    SceInt32 set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set);
+-    // Sets one of the system events, like the open event, with user_data for its waiters, or returns
+-    // UNKNOWN_EVENT_ID if it was deleted.
+-    SceInt32 set_system_event(SceUInt32 event, SceUInt64 user_data);
+     SceInt32 clear(SceUInt32 clear_pattern);
+-    SceInt32 cancel(SceUInt32 *num_wait_threads);
++    virtual SceInt32 cancel(SceUInt32 *num_wait_threads);
+     // Cancels the waits like cancel(), then replaces the whole pattern and the user data.
+     SceInt32 cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *num_wait_threads);
+     // Sets result to the event's bit pattern, or returns UNKNOWN_EVENT_ID if it was deleted.
+-    SceInt32 get_pattern(SceUInt32 &result) const;
+-    // Fills info with what the simple event's info reports, or returns UNKNOWN_EVENT_ID if it was
+-    // deleted.
+-    SceInt32 info(SceKernelEventInfo &info) const;
++    SceInt32 get_pattern(SceUInt32 &result);
++    // Fills info with what the event's info reports, or returns UNKNOWN_EVENT_ID if it was deleted.
++    SceInt32 info(SceKernelEventInfo &info);
++
++protected:
++    Event(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUInt64 init_user_data);
+ 
+-private:
+     struct WaitEntry {
+         SceUInt32 pattern;
+         SceUInt32 *result_pattern;
+@@ -177,8 +170,14 @@ private:
+     };
+ 
+     void on_delete(SceUID deleter) override;
++    // Brings the event up to date before an event operation looks at it. Called with the lock held.
++    // Only a timer has anything to do.
++    virtual void catch_up() {}
+     // Takes the event if wait_pattern matches, or returns SCE_KERNEL_ERROR_EVENT_COND. The lock must be held.
+     SceInt32 try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data);
++    // Returns the guest's result of a wait, and gives a wait that a delete or a cancel ended the error
++    // event.
++    SceInt32 wait_result(const WaitResult &r, SceUInt32 *result_pattern);
+     // Sets or pulses the bits with user_data and gives them to the waits they match. The lock must be
+     // held.
+     void fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set);
+@@ -188,61 +187,77 @@ private:
+     // Guarded by the lock
+     WaitQueue<WaitEntry> waiters;
+     SceUInt32 pattern;
+-    SceUInt64 last_user_data = 0;
++    SceUInt64 last_user_data;
++};
++
++class SimpleEvent final : public WithUidClass<Event, UidClass::simple_event> {
++public:
++    SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUID creator);
++
++    // Returns the error a create with these arguments gets, or SCE_KERNEL_OK
++    static SceInt32 check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern);
++
++    SceInt32 wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks);
++    SceInt32 set_or_pulse(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set);
++    // Sets one of the system events, like the open event, with user_data for its waiters, or returns
++    // UNKNOWN_EVENT_ID if it was deleted.
++    SceInt32 set_system_event(SceUInt32 event, SceUInt64 user_data);
+ };
+ 
+ typedef std::shared_ptr<SimpleEvent> SimpleEventPtr;
+ 
+-class Timer final : public WithUidClass<SyncPrimitive, UidClass::timer> {
++using EventPtr = std::shared_ptr<Event>;
++
++class Timer final : public WithUidClass<Event, UidClass::timer> {
+ public:
+-    Timer(SceUInt32 attr, const char *name);
++    Timer(SceUInt32 attr, const char *name, SceUID creator);
+ 
+     SceInt32 set_event(SceUID type, SceKernelSysClock interval, SceInt32 repeats);
+-    SceInt32 wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks);
+-    SceInt32 poll(SceUInt32 *result_pattern, SceUInt64 *user_data);
+-    SceInt32 clear();
++    SceInt32 wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks);
+     SceInt32 start();
+     SceInt32 stop();
+-    SceInt32 cancel(SceUInt32 *num_wait_threads);
++    SceInt32 cancel(SceUInt32 *num_wait_threads) override;
+     // Replaces the count and returns its old value, or the error.
+     std::expected<uint64_t, SceInt32> set_time(uint64_t new_time);
+     // Sets time to how much time the timer counted, or returns UNKNOWN_TIMER_ID if it was deleted.
+     SceInt32 get_time(uint64_t &time) const;
+-    // Sets time to the clock time the count runs from, 0 if the timer never started, or returns
++    // Sets time to the clock time the count runs from, 0 while the timer is stopped, or returns
+     // UNKNOWN_TIMER_ID if it was deleted.
+     SceInt32 get_base(uint64_t &time) const;
+-    // Fills info with what the event info of the timer reports, or returns UNKNOWN_EVENT_ID if it was
+-    // deleted.
+-    SceInt32 event_info(SceKernelEventInfo &info) const;
++    // Sets time to how much time the armed event has left, or returns EVENT_NOT_SET with no event
++    // armed or UNKNOWN_TIMER_ID if it was deleted.
++    SceInt32 remaining_time(uint64_t &time);
++    // Fills info with what the timer's info reports, with the clock time the count runs from as the
++    // base of a running timer, or returns UNKNOWN_TIMER_ID if it was deleted.
++    SceInt32 timer_info(SceKernelTimerInfo &info);
+ 
+ private:
+-    struct WaitEntry {
+-        SceUInt32 *result_pattern;
+-    };
+-
+-    void on_delete(SceUID deleter) override;
+-    void schedule_event();
+-    // Wakes the first waiter so it checks the event again
+-    void wake_first();
+-    // Moves next_event to the first event after current_time, or to never if the event doesn't repeat.
+-    void advance_next_event(uint64_t current_time);
+-    // Takes the event if it is set by current_time, or returns SCE_KERNEL_ERROR_EVENT_COND. The lock must be held.
+-    SceInt32 try_take(SceUInt32 *result_pattern, SceUInt64 *user_data, uint64_t current_time);
++    // Fires the event if it is due: sets or pulses SCE_KERNEL_EVENT_TIMER, and queues a repeating
++    // event again an interval after it was due.
++    void catch_up() override;
++    // Queues the event to be due at the clock time deadline, and wakes the first waiter so it sees
++    // the new time. The lock must be held.
++    void queue_event(uint64_t deadline);
++    // Gives the event's bits to the waits they match, and wakes the first waiter left.
++    void serve() override;
++    // Returns when the next event is due, on the clock of wait deadlines. The lock must be held.
++    Deadline event_deadline() const;
+     // Returns how much time the timer counted. The lock must be held.
+     uint64_t count() const;
+ 
+     // Guarded by the lock
+-    // Only the first waiter waits for the next event, the others wait for their turn
+-    WaitQueue<WaitEntry> waiters;
+-
+     bool is_started = false;
++    // An event is set, and a fired one shot event stays armed
++    bool armed = false;
+     bool is_repeat = false;
+     bool is_pulse = false;
+-    bool event_set = false;
+     // The clock time the count runs from while the timer is started, 0 if it never started
+     uint64_t base = 0;
+     // The count while the timer is stopped
+     uint64_t stopped_count = 0;
++    // The count the armed event is due at
++    uint64_t schedule = 0;
++    // The clock time the next event is due, the maximum while none is queued
+     uint64_t next_event = std::numeric_limits<uint64_t>::max();
+     uint64_t event_interval = 0;
+ };
+diff --git a/vita3k/kernel/include/kernel/types.h b/vita3k/kernel/include/kernel/types.h
+index 6069baaa..e8e47483 100644
+--- a/vita3k/kernel/include/kernel/types.h
++++ b/vita3k/kernel/include/kernel/types.h
+@@ -889,6 +889,24 @@ struct SceKernelEventInfo {
+ };
+ static_assert(sizeof(SceKernelEventInfo) == 0x40, "Incorrect size");
+ 
++// What sceKernelGetTimerInfo reports
++struct SceKernelTimerInfo {
++    SceSize size;
++    SceUID timerId;
++    char name[KERNELOBJECT_MAX_NAME_LENGTH + 1];
++    SceUInt32 attr;
++    SceInt32 active;
++    SceKernelSysClock baseTime;
++    SceKernelSysClock currentTime;
++    SceKernelSysClock schedule;
++    SceKernelSysClock interval;
++    SceInt32 type;
++    SceInt32 repeat;
++    SceUInt32 numWaitThreads;
++    SceInt32 reserved;
++};
++static_assert(sizeof(SceKernelTimerInfo) == 0x60, "Incorrect size");
++
+ struct SceKernelMutexInfo {
+     SceSize size;
+     SceUID mutexId;
+diff --git a/vita3k/kernel/src/sync_primitives.cpp b/vita3k/kernel/src/sync_primitives.cpp
+index 1092836b..ae826009 100644
+--- a/vita3k/kernel/src/sync_primitives.cpp
++++ b/vita3k/kernel/src/sync_primitives.cpp
+@@ -41,11 +41,16 @@ SceInt32 SyncPrimitive::check_name(const char *name, SceUInt32 attr) {
+ // * Simple events *
+ // *****************
+ 
+-SimpleEvent::SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_pattern)
+-    : WithUidClass(attr, name)
++Event::Event(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUInt64 init_user_data)
++    : SyncPrimitive(attr, name)
+     , auto_reset(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)
+     , waiters(attr)
+-    , pattern(init_pattern | SCE_KERNEL_EVENT_CREATE) {}
++    , pattern(init_pattern | SCE_KERNEL_EVENT_CREATE)
++    , last_user_data(init_user_data) {}
++
++// The create event comes with the creating thread's user data, like the other system events
++SimpleEvent::SimpleEvent(SceUInt32 attr, const char *name, SceUInt32 init_pattern, SceUID creator)
++    : WithUidClass(attr, name, init_pattern, system_event_user_data(creator)) {}
+ 
+ SceInt32 SimpleEvent::check_create(const char *name, SceUInt32 attr, SceUInt32 init_pattern) {
+     if (const SceInt32 error = check_name(name, attr))
+@@ -58,13 +63,13 @@ SceInt32 SimpleEvent::check_create(const char *name, SceUInt32 attr, SceUInt32 i
+     return SCE_KERNEL_OK;
+ }
+ 
+-void SimpleEvent::on_delete(SceUID deleter) {
++void Event::on_delete(SceUID deleter) {
+     // The waits for the delete event get it with the deleting thread's user data, then the others end
+     fire(SCE_KERNEL_EVENT_DELETE, system_event_user_data(deleter), true);
+     waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+ }
+ 
+-SceInt32 SimpleEvent::try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
++SceInt32 Event::try_take(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
+     if (!(pattern & wait_pattern))
+         return SCE_KERNEL_ERROR_EVENT_COND;
+ 
+@@ -93,6 +98,10 @@ SceInt32 SimpleEvent::wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern,
+             return last;
+         return std::nullopt;
+     });
++    return wait_result(r, result_pattern);
++}
++
++SceInt32 Event::wait_result(const WaitResult &r, SceUInt32 *result_pattern) {
+     const SceInt32 err = guest_result(r);
+     // A wait ended by a delete or a cancel gets the error event and no user data. If the wait got
+     // the bits, they are already written, also when it returns NOTIFY_CALLBACK.
+@@ -101,10 +110,11 @@ SceInt32 SimpleEvent::wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern,
+     return err;
+ }
+ 
+-SceInt32 SimpleEvent::poll(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
++SceInt32 Event::poll(SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+     if (wait_pattern == 0)
+         return SCE_KERNEL_ERROR_INVALID_ARGUMENT;
+ 
+@@ -130,7 +140,7 @@ SceInt32 SimpleEvent::set_system_event(SceUInt32 event, SceUInt64 user_data) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-void SimpleEvent::fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set) {
++void Event::fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set) {
+     // A set or pulse of no bits changes nothing, not even the user data
+     if (set_pattern == 0)
+         return;
+@@ -145,7 +155,7 @@ void SimpleEvent::fire(SceUInt32 set_pattern, SceUInt64 user_data, bool is_set)
+         pattern &= ~set_pattern;
+ }
+ 
+-void SimpleEvent::serve() {
++void Event::serve() {
+     waiters.wake_if([&](auto &waiter) {
+         const WaitEntry &wait = waiter.entry;
+         if (!(pattern & wait.pattern))
+@@ -165,10 +175,11 @@ void SimpleEvent::serve() {
+     });
+ }
+ 
+-SceInt32 SimpleEvent::clear(SceUInt32 clear_pattern) {
++SceInt32 Event::clear(SceUInt32 clear_pattern) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+     if (clear_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
+         return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
+ 
+@@ -177,10 +188,11 @@ SceInt32 SimpleEvent::clear(SceUInt32 clear_pattern) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 SimpleEvent::cancel(SceUInt32 *num_wait_threads) {
++SceInt32 Event::cancel(SceUInt32 *num_wait_threads) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+ 
+     const auto nb_threads = static_cast<SceUInt32>(waiters.wake_all(SCE_KERNEL_ERROR_WAIT_CANCEL));
+     if (num_wait_threads)
+@@ -189,10 +201,11 @@ SceInt32 SimpleEvent::cancel(SceUInt32 *num_wait_threads) {
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 SimpleEvent::cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *num_wait_threads) {
++SceInt32 Event::cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt32 *num_wait_threads) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+     if (set_pattern & ~SCE_KERNEL_EVENT_USER_DEFINED_MASK)
+         return SCE_KERNEL_ERROR_ILLEGAL_PATTERN;
+ 
+@@ -206,18 +219,20 @@ SceInt32 SimpleEvent::cancel(SceUInt32 set_pattern, SceUInt64 user_data, SceUInt
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 SimpleEvent::get_pattern(SceUInt32 &result) const {
++SceInt32 Event::get_pattern(SceUInt32 &result) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+     result = pattern;
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 SimpleEvent::info(SceKernelEventInfo &info) const {
++SceInt32 Event::info(SceKernelEventInfo &info) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++    catch_up();
+ 
+     info = {};
+     info.eventId = uid;
+@@ -239,24 +254,44 @@ inline uint64_t get_current_time() {
+         .count();
+ }
+ 
+-Timer::Timer(SceUInt32 attr, const char *name)
+-    : WithUidClass(attr, name)
+-    , waiters(attr) {}
++Timer::Timer(SceUInt32 attr, const char *name, SceUID creator)
++    : WithUidClass(attr, name, 0, system_event_user_data(creator)) {}
+ 
+-void Timer::on_delete(SceUID) {
+-    waiters.wake_all(SCE_KERNEL_ERROR_WAIT_DELETE);
+-}
++// A timer event is due at least this long after it was queued or after the event before it
++constexpr uint64_t TIMER_EVENT_FLOOR = 200;
+ 
+-void Timer::schedule_event() {
+-    next_event = get_current_time() + event_interval;
+-
+-    // the first waiter has to wait for the new event time
+-    wake_first();
++void Timer::catch_up() {
++    const uint64_t now = get_current_time();
++    if (next_event > now)
++        return;
++    fire(SCE_KERNEL_EVENT_TIMER, 0, !is_pulse);
++    // A one shot event leaves the queue but stays armed, so a start or a set time can queue it again
++    if (!is_repeat) {
++        next_event = std::numeric_limits<uint64_t>::max();
++        return;
++    }
++    // A repeating event is due again an interval after it was due. With nobody waiting, the events
++    // it missed meanwhile change nothing, so they are skipped.
++    const uint64_t interval = std::max(event_interval, TIMER_EVENT_FLOOR);
++    uint64_t next = next_event + interval;
++    if (waiters.empty() && next <= now)
++        next += ((now - next) / interval + 1) * interval;
++    next_event = std::max(next, now + TIMER_EVENT_FLOOR);
++    schedule = next_event - base;
++}
++
++void Timer::queue_event(uint64_t deadline) {
++    next_event = std::max(deadline, get_current_time() + TIMER_EVENT_FLOOR);
++    // The first waiter sleeps until the old event time, so wake it to see the new one
++    if (const auto *const first = waiters.front())
++        first->thread->wake();
+ }
+ 
+-void Timer::wake_first() {
+-    if (WaitQueue<WaitEntry>::Waiter *const first = waiters.front())
+-        first->thread->wake();
++Deadline Timer::event_deadline() const {
++    if (next_event == std::numeric_limits<uint64_t>::max())
++        return Deadline::max();
++    const uint64_t now = get_current_time();
++    return std::chrono::steady_clock::now() + std::chrono::microseconds(next_event > now ? next_event - now : 0);
+ }
+ 
+ SceInt32 Timer::set_event(SceUID type, SceKernelSysClock interval, SceInt32 repeats) {
+@@ -265,149 +300,92 @@ SceInt32 Timer::set_event(SceUID type, SceKernelSysClock interval, SceInt32 repe
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
+     if (type != SCE_KERNEL_TIMER_TYPE_SET_EVENT && type != SCE_KERNEL_TIMER_TYPE_PULSE_EVENT)
+         return SCE_KERNEL_ERROR_ILLEGAL_TYPE;
++    catch_up();
+ 
+     is_pulse = type == SCE_KERNEL_TIMER_TYPE_PULSE_EVENT;
+     is_repeat = repeats != 0;
+     event_interval = interval;
+-
++    armed = true;
++    schedule = count() + interval;
++    // A stopped timer queues the event when it starts
+     if (is_started)
+-        schedule_event();
+-
+-    return SCE_KERNEL_OK;
+-}
+-
+-void Timer::advance_next_event(uint64_t current_time) {
+-    if (is_repeat) {
+-        // the event repeats every event_interval, go to the next one after current_time
+-        next_event += ((current_time - next_event - 1) / event_interval + 1) * event_interval;
+-    } else {
++        queue_event(get_current_time() + interval);
++    else
+         next_event = std::numeric_limits<uint64_t>::max();
+-    }
+-}
+-
+-SceInt32 Timer::try_take(SceUInt32 *result_pattern, SceUInt64 *user_data, uint64_t current_time) {
+-    // A take that fails gets no bits, like a simple event poll
+-    if (result_pattern)
+-        *result_pattern = 0;
+-    if (user_data)
+-        *user_data = 0;
+-
+-    if (next_event < current_time) {
+-        if (!is_pulse) {
+-            // we can reach pulse event only by waiting
+-            event_set = true;
+-        }
+-
+-        advance_next_event(current_time);
+-    }
+-
+-    if (!event_set)
+-        return SCE_KERNEL_ERROR_EVENT_COND;
+-
+-    if (result_pattern)
+-        *result_pattern = SCE_KERNEL_EVENT_TIMER;
+-    if (attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)
+-        event_set = false;
+ 
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
++SceInt32 Timer::wait(const ThreadStatePtr &thread, SceUInt32 wait_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
+     auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+-    if (const WaitResult r = run_pending_callbacks(guard, thread, callbacks); !r || *r != SCE_KERNEL_OK)
+-        return guest_result(r);
+-
+-    uint64_t current_time = get_current_time();
+-    if (const SceInt32 result = try_take(result_pattern, user_data, current_time); result != SCE_KERNEL_ERROR_EVENT_COND)
+-        return result;
+-
+-    const Deadline guest_deadline = deadline_from(timeout);
+-    WaitQueue<WaitEntry>::Waiter waiter{ .thread = thread, .priority = thread->get_priority(), .entry = { result_pattern } };
+-    waiters.push(waiter);
+ 
++    // Like wait_loop(), but the first waiter also wakes when the next event is due. It fires the event
++    // then, which gives it to the waiters in queue order, this one included.
++    const WaitTarget target{ SCE_KERNEL_WAITTYPE_EVENT, uid, callbacks };
++    WaitQueue<WaitEntry>::Waiter waiter{ .thread = thread, .entry = { wait_pattern, result_pattern, user_data } };
++    const Deadline deadline = deadline_from(timeout);
++    // The result of the last sleep, then the final result
++    WaitResult result = SCE_KERNEL_OK;
+     while (true) {
+-        // A waker ended the wait, such as a delete
+-        if (waiter.result) {
+-            writeback_timeout(timeout, guest_deadline);
+-            return *waiter.result;
+-        }
+-        // only the first waiter waits for the event, the others wait until they are first
+-        const bool is_first = waiters.front() == &waiter;
+-        Deadline deadline = guest_deadline;
+-        if (is_first && next_event != std::numeric_limits<uint64_t>::max()) {
+-            const uint64_t wait_time = next_event > current_time ? next_event - current_time : 0;
+-            deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::microseconds(wait_time));
++        if (const WaitResult r = run_pending_callbacks(guard, thread, callbacks); !r || *r != SCE_KERNEL_OK)
++            return wait_result(r, result_pattern);
++        // Events that are already due fire before the take, so the waiter can't get an old pulse
++        catch_up();
++        if (try_take(wait_pattern, result_pattern, user_data) == SCE_KERNEL_OK)
++            return wait_result(result, result_pattern);
++        if (std::chrono::steady_clock::now() >= deadline) {
++            if (timeout)
++                *timeout = 0;
++            result = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
++            break;
+         }
+-
+-        guard.unlock();
+-        WaitResult r = thread->wait({ SCE_KERNEL_WAITTYPE_EVENT, uid, callbacks }, deadline);
+-        if (r && *r == SCE_KERNEL_ERROR_NOTIFY_CALLBACK)
+-            r = thread->run_callbacks();
+-        guard.lock();
+-        // A waker that ended the wait meanwhile, like an event that reached every waiter at once,
+-        // wins over the deadline and the thread's end
+-        if (waiter.result) {
+-            writeback_timeout(timeout, guest_deadline);
+-            return *waiter.result;
++        if (callbacks && thread->has_pending_callbacks()) {
++            result = SCE_KERNEL_ERROR_NOTIFY_CALLBACK;
++            continue;
+         }
+-        if (!r) {
+-            waiters.remove(waiter);
+-            wake_first();
+-            return guest_result(r);
++        waiter.priority = thread->get_priority();
++        waiters.push(waiter);
++        while (true) {
++            const Deadline wake = waiters.front() == &waiter ? std::min(deadline, event_deadline()) : deadline;
++            guard.unlock();
++            result = thread->wait(target, wake);
++            guard.lock();
++            if (waiter.result || !result || *result == SCE_KERNEL_ERROR_NOTIFY_CALLBACK)
++                break;
++            // Woken because the next event is due, the schedule changed, or for no reason. The
++            // waiter stays queued.
++            catch_up();
++            if (waiter.result || std::chrono::steady_clock::now() >= deadline) {
++                result = SCE_KERNEL_ERROR_WAIT_TIMEOUT;
++                break;
++            }
+         }
+-
+-        current_time = get_current_time();
+-        if (waiters.front() == &waiter && (event_set || current_time > next_event))
++        if (timeout)
++            *timeout = time_left_until(deadline);
++        if (waiter.result) {
++            result = *waiter.result;
+             break;
+-
+-        // The guest's timeout ran out before an event came
+-        if (std::chrono::steady_clock::now() >= guest_deadline) {
+-            waiters.remove(waiter);
+-            wake_first();
+-            writeback_timeout(timeout, guest_deadline);
+-            return SCE_KERNEL_ERROR_WAIT_TIMEOUT;
+         }
++        waiters.remove(waiter);
++        serve();
++        if (!result || *result != SCE_KERNEL_ERROR_NOTIFY_CALLBACK)
++            break;
+     }
+-
+-    waiters.remove(waiter);
+-    writeback_timeout(timeout, guest_deadline);
+-    if (result_pattern)
+-        *result_pattern = SCE_KERNEL_EVENT_TIMER;
+-
+-    // An event of a manual reset timer reaches every waiter at once, the events of an auto reset one
+-    // go to the waiters in turn
+-    if (!(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET)) {
+-        waiters.wake_if([](auto &w) {
+-            if (w.entry.result_pattern)
+-                *w.entry.result_pattern = SCE_KERNEL_EVENT_TIMER;
+-            return true;
+-        });
++    // Run the callbacks notified during the wait. Only the thread exiting changes the result.
++    if (result) {
++        if (const WaitResult ran = run_pending_callbacks(guard, thread, callbacks); !ran)
++            result = ran;
+     }
+-    event_set = !is_pulse && !(attr & SCE_KERNEL_EVENT_ATTR_AUTO_RESET);
+-    advance_next_event(current_time);
+-    // the next waiter checks the event in turn
+-    wake_first();
+-
+-    return SCE_KERNEL_OK;
+-}
+-
+-SceInt32 Timer::poll(SceUInt32 *result_pattern, SceUInt64 *user_data) {
+-    const auto guard = lock();
+-    if (!guard)
+-        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+-
+-    return try_take(result_pattern, user_data, get_current_time());
++    return wait_result(result, result_pattern);
+ }
+ 
+-SceInt32 Timer::clear() {
+-    const auto guard = lock();
+-    if (!guard)
+-        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+-
+-    event_set = false;
+-    return SCE_KERNEL_OK;
++void Timer::serve() {
++    Event::serve();
++    // The first waiter may be a new one, which now has to wake for the next event
++    if (const auto *const first = waiters.front())
++        first->thread->wake();
+ }
+ 
+ SceInt32 Timer::start() {
+@@ -417,13 +395,15 @@ SceInt32 Timer::start() {
+ 
+     if (is_started)
+         return 1;
++    catch_up();
+ 
+-    // The count goes on from where it stopped
++    // The count goes on from where it stopped, and an armed event is due after the time it has left,
++    // at once if it already fired
+     is_started = true;
+-    base = get_current_time() - stopped_count;
+-
+-    if (event_interval != 0)
+-        schedule_event();
++    const uint64_t now = get_current_time();
++    base = now - stopped_count;
++    if (armed)
++        queue_event(now + (schedule > stopped_count ? schedule - stopped_count : 0));
+ 
+     return SCE_KERNEL_OK;
+ }
+@@ -435,6 +415,7 @@ SceInt32 Timer::stop() {
+ 
+     if (!is_started)
+         return 0;
++    catch_up();
+ 
+     stopped_count = count();
+     is_started = false;
+@@ -447,12 +428,19 @@ std::expected<uint64_t, SceInt32> Timer::set_time(uint64_t new_time) {
+     const auto guard = lock();
+     if (!guard)
+         return std::unexpected(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
++    catch_up();
+ 
+     const uint64_t old_count = count();
+-    if (is_started)
+-        base = get_current_time() - new_time;
+-    else
++    if (is_started) {
++        const uint64_t now = get_current_time();
++        base = now - new_time;
++        // If the new time is before the armed event's time, the event is due when the count reaches
++        // it again. Otherwise it stays due when it was.
++        if (armed && new_time < schedule)
++            queue_event(now + (schedule - new_time));
++    } else {
+         stopped_count = new_time;
++    }
+     return old_count;
+ }
+ 
+@@ -472,22 +460,39 @@ SceInt32 Timer::get_base(uint64_t &time) const {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
+-    time = base;
++    time = is_started ? base : 0;
+     return SCE_KERNEL_OK;
+ }
+ 
+-SceInt32 Timer::event_info(SceKernelEventInfo &info) const {
++SceInt32 Timer::remaining_time(uint64_t &time) {
+     const auto guard = lock();
+     if (!guard)
+-        return SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
++        return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
++    catch_up();
++    if (!armed)
++        return SCE_KERNEL_ERROR_EVENT_NOT_SET;
++    time = schedule - count();
++    return SCE_KERNEL_OK;
++}
++
++SceInt32 Timer::timer_info(SceKernelTimerInfo &info) {
++    const auto guard = lock();
++    if (!guard)
++        return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
++    catch_up();
+ 
+-    // A set event that came is set, also before a wait or a poll took it
+-    const bool fired = event_set || (!is_pulse && next_event < get_current_time());
+     info = {};
+-    info.eventId = uid;
++    info.timerId = uid;
+     strncpy(info.name, name.c_str(), KERNELOBJECT_MAX_NAME_LENGTH + 1);
+     info.attr = attr;
+-    info.eventPattern = SCE_KERNEL_EVENT_CREATE | (fired ? SCE_KERNEL_EVENT_TIMER : 0);
++    info.active = is_started;
++    // The base of a running timer, the count of a stopped one
++    info.baseTime = is_started ? base : stopped_count;
++    info.currentTime = count();
++    info.schedule = armed ? schedule : 0;
++    info.interval = event_interval;
++    info.type = is_pulse ? SCE_KERNEL_TIMER_TYPE_PULSE_EVENT : SCE_KERNEL_TIMER_TYPE_SET_EVENT;
++    info.repeat = is_repeat;
+     info.numWaitThreads = static_cast<SceUInt32>(waiters.size());
+     return SCE_KERNEL_OK;
+ }
+@@ -496,12 +501,13 @@ SceInt32 Timer::cancel(SceUInt32 *num_wait_threads) {
+     const auto guard = lock();
+     if (!guard)
+         return SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
++    catch_up();
+ 
+     const auto nb_threads = static_cast<SceUInt32>(waiters.wake_all(SCE_KERNEL_ERROR_WAIT_CANCEL));
+-    // The event set with sceKernelSetTimerEvent is canceled too
++    // The event set with sceKernelSetTimerEvent is canceled too, but the timer keeps running with
++    // the event's interval and type
++    armed = false;
+     is_repeat = false;
+-    is_pulse = false;
+-    event_interval = 0;
+     next_event = std::numeric_limits<uint64_t>::max();
+     if (num_wait_threads)
+         *num_wait_threads = nb_threads;
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+index 3a5a8f57..2528f4d5 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.cpp
+@@ -52,6 +52,13 @@ static void write_info(T *info, T full, SceSize size) {
+     memcpy(info, &full, size);
+ }
+ 
++// Finds a simple event or a timer, which are both events.
++static EventPtr find_event(EmuEnvState &emuenv, SceUID event_id) {
++    if (SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
++        return event;
++    return emuenv.kernel.objects.find<Timer>(event_id);
++}
++
+ // Waits on a simple event or a timer, which are both events.
+ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID thread_id, SceUID event_id, SceUInt32 bit_pattern, SceUInt32 *result_pattern, SceUInt64 *user_data, SceUInt32 *timeout, bool callbacks) {
+     // The wait writes to local copies that go to the guest when it returns, so callbacks that run
+@@ -67,7 +74,7 @@ static SceInt32 wait_event(EmuEnvState &emuenv, const char *export_name, SceUID
+     if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
+         result = event->wait(thread, bit_pattern, pattern_copy, data_copy, timeout_copy, callbacks);
+     else if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(event_id))
+-        result = timer->wait(thread, pattern_copy, data_copy, timeout_copy, callbacks);
++        result = timer->wait(thread, bit_pattern, pattern_copy, data_copy, timeout_copy, callbacks);
+     else
+         result = RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+     if (result_pattern)
+@@ -120,15 +127,12 @@ EXPORT(int, __sceKernelCreateLwMutex, Ptr<SceKernelLwMutexWork> workarea, const
+ 
+ EXPORT(SceInt32, _sceKernelCancelEvent, SceUID eventId, SceUInt32 *pNumWaitThreads) {
+     TRACY_FUNC(_sceKernelCancelEvent, eventId, pNumWaitThreads);
+-    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(eventId))
+-        return event->cancel(pNumWaitThreads);
+-    // this may also be a timer event
+-    if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(eventId)) {
+-        const SceInt32 result = timer->cancel(pNumWaitThreads);
+-        // Deleted since the lookup, reported like the other event functions do
+-        return result == SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID ? SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID : result;
+-    }
+-    return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    const EventPtr event = find_event(emuenv, eventId);
++    if (!event)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
++    const SceInt32 result = event->cancel(pNumWaitThreads);
++    // A timer deleted since the lookup is reported like the other event functions do
++    return result == SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID ? SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID : result;
+ }
+ 
+ EXPORT(SceInt32, _sceKernelCancelEventFlag, SceUID event_id, SceUInt pattern, SceUInt32 *num_wait_thread) {
+@@ -293,7 +297,7 @@ EXPORT(SceUID, _sceKernelCreateSimpleEvent, const char *name, SceUInt32 attr, Sc
+     if (const SceInt32 error = SimpleEvent::check_create(name, attr, init_pattern))
+         return RET_ERROR(error);
+ 
+-    const auto event = std::make_shared<SimpleEvent>(attr, name, init_pattern);
++    const auto event = std::make_shared<SimpleEvent>(attr, name, init_pattern, thread_id);
+     return emuenv.kernel.objects.add(event, emuenv.kernel.get_next_uid());
+ }
+ 
+@@ -302,7 +306,7 @@ EXPORT(int, _sceKernelCreateTimer, const char *name, SceUInt32 attr, const uint3
+     if (const SceInt32 error = SyncPrimitive::check_name(name, attr))
+         return RET_ERROR(error);
+ 
+-    const auto timer = std::make_shared<Timer>(attr, name);
++    const auto timer = std::make_shared<Timer>(attr, name, thread_id);
+     return emuenv.kernel.objects.add(timer, emuenv.kernel.get_next_uid());
+ }
+ 
+@@ -404,14 +408,9 @@ EXPORT(SceInt32, _sceKernelGetEventFlagInfo, SceUID evfId, Ptr<SceKernelEventFla
+ 
+ EXPORT(SceInt32, _sceKernelGetEventInfo, SceUID eventId, Ptr<SceKernelEventInfo> pInfo) {
+     TRACY_FUNC(_sceKernelGetEventInfo, eventId, pInfo);
+-    // A timer is an event too
+     SceKernelEventInfo full;
+-    SceInt32 found = SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID;
+-    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(eventId))
+-        found = event->info(full);
+-    else if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(eventId))
+-        found = timer->event_info(full);
+-    if (found != SCE_KERNEL_OK)
++    const EventPtr event = find_event(emuenv, eventId);
++    if (!event || event->info(full) != SCE_KERNEL_OK)
+         return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+ 
+     SceKernelEventInfo *info = pInfo.get(emuenv.mem);
+@@ -708,14 +707,40 @@ EXPORT(int, _sceKernelGetTimerBase) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _sceKernelGetTimerEventRemainingTime) {
+-    TRACY_FUNC(_sceKernelGetTimerEventRemainingTime);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetTimerEventRemainingTime, SceUID timer_handle, SceKernelSysClock *time) {
++    TRACY_FUNC(_sceKernelGetTimerEventRemainingTime, timer_handle, time);
++    if (!time)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++    // The time reads 0 when the call fails
++    uint64_t left = 0;
++    const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
++    const SceInt32 result = timer ? timer->remaining_time(left) : SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID;
++    *time = left;
++    if (result < 0)
++        return RET_ERROR(result);
++    return SCE_KERNEL_OK;
+ }
+ 
+-EXPORT(int, _sceKernelGetTimerInfo) {
+-    TRACY_FUNC(_sceKernelGetTimerInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelGetTimerInfo, SceUID timer_handle, Ptr<SceKernelTimerInfo> pInfo) {
++    TRACY_FUNC(_sceKernelGetTimerInfo, timer_handle, pInfo);
++    SceKernelTimerInfo full;
++    const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
++    if (!timer || timer->timer_info(full) != SCE_KERNEL_OK)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
++
++    SceKernelTimerInfo *info = pInfo.get(emuenv.mem);
++    if (!info)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
++
++    if (info->size > sizeof(*info))
++        return RET_ERROR(SCE_KERNEL_ERROR_NO_MEMORY);
++
++    // A running timer's base is the process time it counts from
++    if (full.active)
++        full.baseTime = emuenv.kernel.process_time_at(full.baseTime);
++    write_info(info, full);
++
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, _sceKernelGetTimerTime) {
+@@ -823,11 +848,8 @@ EXPORT(int, _sceKernelPollEvent, SceUID event_id, SceUInt32 bit_pattern, SceUInt
+         *result_pattern = 0;
+     if (user_data)
+         *user_data = 0;
+-    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
++    if (const EventPtr event = find_event(emuenv, event_id))
+         return event->poll(bit_pattern, result_pattern, user_data);
+-    // this may also be a timer event
+-    if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(event_id))
+-        return timer->poll(result_pattern, user_data);
+     return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+ }
+ 
+@@ -926,9 +948,19 @@ EXPORT(int, _sceKernelSetTimerEvent) {
+     return UNIMPLEMENTED();
+ }
+ 
+-EXPORT(int, _sceKernelSetTimerTime) {
+-    TRACY_FUNC(_sceKernelSetTimerTime);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, _sceKernelSetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
++    TRACY_FUNC(_sceKernelSetTimerTime, timer_handle, time);
++    // The new time is read before the timer is looked up, and the old one goes back in its place
++    if (!time)
++        return RET_ERROR(SCE_KERNEL_ERROR_INVALID_MEMORY_ACCESS);
++    const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
++    if (!timer)
++        return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_TIMER_ID);
++    const auto old_time = timer->set_time(*time);
++    if (!old_time)
++        return RET_ERROR(old_time.error());
++    *time = *old_time;
++    return SCE_KERNEL_OK;
+ }
+ 
+ EXPORT(int, _sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea) {
+@@ -1227,11 +1259,8 @@ EXPORT(int, sceKernelCheckWaitableStatus) {
+ 
+ EXPORT(SceInt32, sceKernelClearEvent, SceUID event_id, SceUInt32 clear_pattern) {
+     TRACY_FUNC(sceKernelClearEvent, event_id, clear_pattern);
+-    if (const SimpleEventPtr event = emuenv.kernel.objects.find<SimpleEvent>(event_id))
++    if (const EventPtr event = find_event(emuenv, event_id))
+         return event->clear(clear_pattern);
+-    // this may also be a timer event
+-    if (const TimerPtr timer = emuenv.kernel.objects.find<Timer>(event_id))
+-        return timer->clear();
+     return RET_ERROR(SCE_KERNEL_ERROR_UNKNOWN_EVENT_ID);
+ }
+ 
+diff --git a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+index c010df15..964dc2d6 100644
+--- a/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
++++ b/vita3k/modules/SceKernelThreadMgr/SceThreadmgr.h
+@@ -68,6 +68,9 @@ DECL_EXPORT(int, _sceKernelGetMutexInfo, SceUID mutexId, SceKernelMutexInfo *pIn
+ DECL_EXPORT(SceInt32, _sceKernelGetSemaInfo, SceUID semaId, Ptr<SceKernelSemaInfo> pInfo);
+ DECL_EXPORT(SceInt32, _sceKernelWaitCond, SceUID condId, SceUInt32 *pTimeout);
+ DECL_EXPORT(SceInt32, _sceKernelWaitCondCB, SceUID condId, SceUInt32 *pTimeout);
++DECL_EXPORT(SceInt32, _sceKernelGetTimerEventRemainingTime, SceUID timer_handle, SceKernelSysClock *time);
++DECL_EXPORT(SceInt32, _sceKernelGetTimerInfo, SceUID timer_handle, Ptr<SceKernelTimerInfo> pInfo);
++DECL_EXPORT(SceInt32, _sceKernelSetTimerTime, SceUID timer_handle, SceKernelSysClock *time);
+ DECL_EXPORT(SceInt32, _sceKernelWaitEventFlag, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout);
+ DECL_EXPORT(SceInt32, _sceKernelWaitEventFlagCB, SceUID evfId, SceUInt32 bitPattern, SceUInt32 waitMode, SceUInt32 *pResultPat, SceUInt32 *pTimeout);
+ DECL_EXPORT(SceInt32, _sceKernelWaitSema, SceUID semaId, SceInt32 needCount, SceUInt32 *pTimeout);
+diff --git a/vita3k/modules/SceLibKernel/SceLibKernel.cpp b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+index 012a6047..5710fa3d 100644
+--- a/vita3k/modules/SceLibKernel/SceLibKernel.cpp
++++ b/vita3k/modules/SceLibKernel/SceLibKernel.cpp
+@@ -1541,6 +1541,8 @@ EXPORT(int, sceKernelGetThreadRunStatus) {
+ 
+ EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time) {
+     TRACY_FUNC(sceKernelGetTimerBase, timer_handle, time);
++    if (!time)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+     const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
+     uint64_t base;
+     if (!timer || timer->get_base(base) != SCE_KERNEL_OK)
+@@ -1551,18 +1553,20 @@ EXPORT(int, sceKernelGetTimerBase, SceUID timer_handle, SceKernelSysClock *time)
+     return 0;
+ }
+ 
+-EXPORT(int, sceKernelGetTimerEventRemainingTime) {
+-    TRACY_FUNC(sceKernelGetTimerEventRemainingTime);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetTimerEventRemainingTime, SceUID timer_handle, SceKernelSysClock *time) {
++    TRACY_FUNC(sceKernelGetTimerEventRemainingTime, timer_handle, time);
++    return CALL_EXPORT(_sceKernelGetTimerEventRemainingTime, timer_handle, time);
+ }
+ 
+-EXPORT(int, sceKernelGetTimerInfo) {
+-    TRACY_FUNC(sceKernelGetTimerInfo);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelGetTimerInfo, SceUID timer_handle, Ptr<SceKernelTimerInfo> pInfo) {
++    TRACY_FUNC(sceKernelGetTimerInfo, timer_handle, pInfo);
++    return CALL_EXPORT(_sceKernelGetTimerInfo, timer_handle, pInfo);
+ }
+ 
+ EXPORT(int, sceKernelGetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
+     TRACY_FUNC(sceKernelGetTimerTime, timer_handle, time);
++    if (!time)
++        return RET_ERROR(SCE_KERNEL_ERROR_ILLEGAL_ADDR);
+     const TimerPtr timer = emuenv.kernel.objects.find<Timer>(timer_handle);
+     uint64_t count;
+     if (!timer || timer->get_time(count) != SCE_KERNEL_OK)
+@@ -1790,9 +1794,9 @@ EXPORT(int, sceKernelSetTimerEvent, SceUID timer_handle, SceInt32 type, SceKerne
+     return timer->set_event(type, *interval, repeats);
+ }
+ 
+-EXPORT(int, sceKernelSetTimerTime) {
+-    TRACY_FUNC(sceKernelSetTimerTime);
+-    return UNIMPLEMENTED();
++EXPORT(SceInt32, sceKernelSetTimerTime, SceUID timer_handle, SceKernelSysClock *time) {
++    TRACY_FUNC(sceKernelSetTimerTime, timer_handle, time);
++    return CALL_EXPORT(_sceKernelSetTimerTime, timer_handle, time);
+ }
+ 
+ EXPORT(int, sceKernelSignalLwCond, Ptr<SceKernelLwCondWork> workarea) {
+-- 
+2.54.0.windows.1
+
